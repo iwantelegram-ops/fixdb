@@ -1129,6 +1129,9 @@ async def check_member_via_monitor(chat_id: int, target: "int | str") -> "bool |
     except Exception as e:
         print(f"[MonitorQuery] check_member_via_monitor chat={chat_id} target={target}: {e}")
         return None
+
+
+async def query_admin_bio_ok(chat_id: int, user_id: int) -> "bool | None":
     """
     Baca hasil cek "Bio Admin Wajib" (NewsCore) dari DB untuk pasangan
     (chat_id, user_id). Ditulis bersamaan dengan has_link oleh

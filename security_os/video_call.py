@@ -61,6 +61,7 @@ if _BOT_DIR_VC not in _sys_path_fix.path:
 import os
 import asyncio
 import time
+import html as _html_vc
 import re as _re
 from pathlib import Path as _Path
 from datetime import datetime as _dt_vc, timezone as _tz_vc, timedelta as _td_vc
@@ -528,7 +529,7 @@ async def _check_vc_manage_permission(chat_id: int) -> bool:
         return False
 
     try:
-        me     = await userbot.get_me()
+        me     = userbot.me
         member = await userbot.get_chat_member(chat_id, me.id)
         privs  = getattr(member, "privileges", None)
         has_perm = bool(getattr(privs, "can_manage_video_chats", False)) if privs else False
@@ -1339,7 +1340,7 @@ async def _handle_userbot_session_dead(reason: str) -> None:
                 "🛑 <b>Session Userbot Terputus</b>\n\n"
                 "Akun userbot (Security OS) terdeteksi <b>logout/sesi dicabut</b> "
                 "dari sisi Telegram saat sedang berjalan.\n\n"
-                f"<i>Detail:</i> <code>{reason}</code>\n\n"
+                f"<i>Detail:</i> <code>{_html_vc.escape(str(reason))}</code>\n\n"
                 "Security OS untuk semua grup <b>tidak aktif</b> sampai "
                 "userbot login kembali.\n\n"
                 "Login akun userbot baru via:\n"
@@ -2719,7 +2720,7 @@ async def _log_os_action(chat_id: int, user_id: int, action: str, reason: str) -
         text = (
             f"{icon} <b>Security OS — {action}</b>\n"
             f"<code>Grup : {chat_id}</code>\n"
-            f"👤 {name} (<code>{user_id}</code>) {uname}\n"
+            f"👤 {_html_vc.escape(name)} (<code>{user_id}</code>) {_html_vc.escape(uname)}\n"
             f"📌 Alasan : {reason}\n"
             f"🕐 {waktu}"
         )
@@ -3128,7 +3129,7 @@ async def _unmute_user_in_vc(chat_id: int, user_id: int, call_input) -> None:
                 name = u.first_name or str(user_id)
             except Exception:
                 name = str(user_id)
-            mention = f"<a href='tg://user?id={user_id}'>{name}</a>"
+            mention = f"<a href='tg://user?id={user_id}'>{_html_vc.escape(name)}</a>"
             notif_text = (
                 f"🔊 {mention} mic-nya telah diaktifkan kembali.\n"
                 f"<i>Bio sudah tidak mengandung link.</i>"
@@ -3208,7 +3209,7 @@ async def _do_send_warning(chat_id: int, user_id: int) -> None:
         except Exception:
             pass
 
-        mention = f"<a href='tg://user?id={user_id}'>{name}</a>"
+        mention = f"<a href='tg://user?id={user_id}'>{_html_vc.escape(name)}</a>"
 
         # Kirim peringatan di grup via bot biasa — tangani FloodWait
         # Perubahan 2: ambil alasan dari _pending_warn_reason
@@ -3398,7 +3399,7 @@ async def change_userbot(
     _ub_ready   = True
     _ub_dead_notified = False   # reset — userbot baru berhasil aktif lagi
     try:
-        me = await userbot.get_me()
+        me = userbot.me
         uname = me.username or me.first_name or str(me.id)
     except Exception:
         uname = "userbot baru"
