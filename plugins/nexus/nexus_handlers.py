@@ -825,7 +825,7 @@ async def nexus_callback_router(client: Client, cq: CallbackQuery):
             await cq.answer()
         except Exception:
             pass
-        me   = client.me #await client.get_me()
+        me   = client.me
         text = await _welcome_text()
         await _safe_edit(cq.message, text, _main_markup(me.username))
 
@@ -1473,7 +1473,7 @@ async def nexus_callback_router(client: Client, cq: CallbackQuery):
                 pass
             return
         await generate_regex_otomatis_async()
-        me   = client.me #await client.get_me()
+        me   = client.me
         text = await _welcome_text()
         await _safe_edit(cq.message, text, _main_markup(me.username))
         try:
@@ -1514,7 +1514,7 @@ async def nexus_callback_router(client: Client, cq: CallbackQuery):
         except Exception:
             pass
         await nexus_clear_kalimat()
-        me   = client.me #await client.get_me()
+        me   = client.me
         text = await _welcome_text()
         await _safe_edit(cq.message, text, _main_markup(me.username))
 
@@ -1530,7 +1530,7 @@ async def nexus_callback_router(client: Client, cq: CallbackQuery):
         except Exception:
             pass
         await nexus_clear_regex()
-        me   = client.me #await client.get_me()
+        me   = client.me
         text = await _welcome_text()
         await _safe_edit(cq.message, text, _main_markup(me.username))
 

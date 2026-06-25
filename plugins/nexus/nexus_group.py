@@ -31,6 +31,7 @@ v3.1 — Perubahan passive learning:
 
 import os
 import re
+import html
 import asyncio
 from datetime import datetime, timezone, timedelta
 
@@ -445,7 +446,7 @@ async def _log_nexus_deleted(
 
     uid          = message.from_user.id
     cid          = message.chat.id
-    user_mention = f"<a href='tg://user?id={uid}'>{message.from_user.first_name}</a>"
+    user_mention = f"<a href='tg://user?id={uid}'>{html.escape(message.from_user.first_name or str(uid))}</a>"
     waktu        = datetime.now(TZ_WIB).strftime("%d/%m/%Y %H:%M:%S WIB")
 
     kata_display = kata_kunci.split("]", 1)[-1].strip() if "]" in kata_kunci else kata_kunci
@@ -462,13 +463,13 @@ async def _log_nexus_deleted(
         "<b>❖ NEXUS AI — PESAN DIHAPUS ❖</b>\n\n"
         f"🗑️ <b>Eksekusi Filter: {sumber}</b>\n"
         f"◈ <b>User:</b> {user_mention} (<code>{uid}</code>)\n"
-        f"◈ <b>Grup:</b> {message.chat.title} (<code>{cid}</code>)\n"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> <code>{waktu}</code>\n\n"
         "<b>▰▰▰ PEMICU SPAM AI ▰▰▰</b>\n"
-        f"🔑 <b>Kata Kunci Pemicu:</b> <code>{kata_display}</code>\n"
-        f"💥 <b>Pola Interlock:</b>\n<code>{pola_str[:300]}</code>\n\n"
+        f"🔑 <b>Kata Kunci Pemicu:</b> <code>{html.escape(str(kata_display))}</code>\n"
+        f"💥 <b>Pola Interlock:</b>\n<code>{html.escape(str(pola_str)[:300])}</code>\n\n"
         "<b>▰▰▰ KONTEN PESAN ▰▰▰</b>\n"
-        f"<code>{content[:400]}</code>"
+        f"<code>{html.escape(content[:400])}</code>"
     )
     try:
         await client.send_message(
@@ -493,30 +494,31 @@ async def _log_nexus_whitelist_spared(
 
     uid          = message.from_user.id
     cid          = message.chat.id
-    user_mention = f"<a href='tg://user?id={uid}'>{message.from_user.first_name}</a>"
+    user_mention = f"<a href='tg://user?id={uid}'>{html.escape(message.from_user.first_name or str(uid))}</a>"
     waktu        = datetime.now(TZ_WIB).strftime("%d/%m/%Y %H:%M:%S WIB")
 
     kata_display = kata_kunci.split("]", 1)[-1].strip() if "]" in kata_kunci else kata_kunci
     wl_raw       = wl_doc.get("raw", "—")
     wl_kata_list = wl_doc.get("kata_list", [])
     wl_pola      = wl_doc.get("pola", "")
-    wl_kata_str  = ", ".join(f"<code>{k}</code>" for k in wl_kata_list) if wl_kata_list else f"<code>{wl_raw}</code>"
+    wl_raw_safe  = html.escape(str(wl_raw))
+    wl_kata_str  = ", ".join(f"<code>{html.escape(str(k))}</code>" for k in wl_kata_list) if wl_kata_list else f"<code>{wl_raw_safe}</code>"
 
     text = (
         "<b>❖ NEXUS AI — PESAN DIAMANKAN WHITELIST ❖</b>\n\n"
         "🛡️ <b>Pesan Lolos Penghapusan (Dilindungi Whitelist Nexus)</b>\n"
         f"◈ <b>User:</b> {user_mention} (<code>{uid}</code>)\n"
-        f"◈ <b>Grup:</b> {message.chat.title} (<code>{cid}</code>)\n"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> <code>{waktu}</code>\n\n"
         "<b>▰▰▰ POLA SPAM AI YANG TERPICU ▰▰▰</b>\n"
-        f"🔑 <b>Kata Kunci Spam:</b> <code>{kata_display}</code>\n"
-        f"💥 <b>Pola Interlock Spam:</b>\n<code>{spam_pola[:300]}</code>\n\n"
+        f"🔑 <b>Kata Kunci Spam:</b> <code>{html.escape(str(kata_display))}</code>\n"
+        f"💥 <b>Pola Interlock Spam:</b>\n<code>{html.escape(str(spam_pola)[:300])}</code>\n\n"
         "<b>▰▰▰ DILINDUNGI OLEH WHITELIST NEXUS ▰▰▰</b>\n"
         f"🛡️ <b>Kata Aman:</b> {wl_kata_str}\n"
-        f"📝 <b>Raw Whitelist:</b> <code>{wl_raw}</code>\n"
-        f"🔒 <b>Pola Whitelist:</b>\n<code>{wl_pola[:300]}</code>\n\n"
+        f"📝 <b>Raw Whitelist:</b> <code>{wl_raw_safe}</code>\n"
+        f"🔒 <b>Pola Whitelist:</b>\n<code>{html.escape(str(wl_pola)[:300])}</code>\n\n"
         "<b>▰▰▰ KONTEN PESAN ▰▰▰</b>\n"
-        f"<code>{content[:400]}</code>"
+        f"<code>{html.escape(content[:400])}</code>"
     )
     try:
         await client.send_message(
@@ -540,7 +542,7 @@ async def _log_nexus_keroyok(
 
     uid          = message.from_user.id
     cid          = message.chat.id
-    user_mention = f"<a href='tg://user?id={uid}'>{message.from_user.first_name}</a>"
+    user_mention = f"<a href='tg://user?id={uid}'>{html.escape(message.from_user.first_name or str(uid))}</a>"
     waktu        = datetime.now(TZ_WIB).strftime("%d/%m/%Y %H:%M:%S WIB")
     jumlah_racun = len(semua_pola)
 
@@ -548,8 +550,8 @@ async def _log_nexus_keroyok(
     for i, (kk, ps) in enumerate(semua_pola, 1):
         kk_display = kk.split("]", 1)[-1].strip() if "]" in kk else kk
         daftar_racun += (
-            f"<b>Racun #{i}:</b> <code>{kk_display}</code>\n"
-            f"<code>{ps[:200]}</code>\n\n"
+            f"<b>Racun #{i}:</b> <code>{html.escape(str(kk_display))}</code>\n"
+            f"<code>{html.escape(str(ps)[:200])}</code>\n\n"
         )
 
     if pola_tanpa_penawar:
@@ -557,8 +559,8 @@ async def _log_nexus_keroyok(
         for i, (kk, ps) in enumerate(pola_tanpa_penawar, 1):
             kk_display = kk.split("]", 1)[-1].strip() if "]" in kk else kk
             daftar_tanpa_penawar += (
-                f"<b>Pola #{i}:</b> <code>{kk_display}</code>\n"
-                f"<code>{ps[:200]}</code>\n\n"
+                f"<b>Pola #{i}:</b> <code>{html.escape(str(kk_display))}</code>\n"
+                f"<code>{html.escape(str(ps)[:200])}</code>\n\n"
             )
         info_penawar = (
             "<b>▰▰▰ RACUN TANPA PENAWAR ▰▰▰</b>\n"
@@ -579,7 +581,7 @@ async def _log_nexus_keroyok(
         "<b>❖ NEXUS AI — PESAN DIHAPUS (ATURAN KEROYOKAN) ❖</b>\n\n"
         "☠️ <b>Eksekusi Filter: MULTI-PATTERN AMBUSH</b>\n"
         f"◈ <b>User:</b> {user_mention} (<code>{uid}</code>)\n"
-        f"◈ <b>Grup:</b> {message.chat.title} (<code>{cid}</code>)\n"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> <code>{waktu}</code>\n\n"
         f"⚠️ <b>{jumlah_racun} pola spam berbeda mendeteksi kecocokan sekaligus!</b>\n"
         "<i>Whitelist tidak berlaku — satu penawar tidak bisa menetralkan "
@@ -588,7 +590,7 @@ async def _log_nexus_keroyok(
         f"{daftar_racun}"
         f"{info_penawar}"
         "<b>▰▰▰ KONTEN PESAN ▰▰▰</b>\n"
-        f"<code>{content[:400]}</code>"
+        f"<code>{html.escape(content[:400])}</code>"
     )
     try:
         await client.send_message(
@@ -932,7 +934,7 @@ async def nexus_silent_filter(client: Client, message: Message):
 async def nexus_tracking_grup(client: Client, update: ChatMemberUpdated):
     try:
         from pyrogram.enums import ChatType
-        me = client.me #await client.get_me()
+        me = client.me
         if not update.new_chat_member or update.new_chat_member.user.id != me.id:
             return
 
