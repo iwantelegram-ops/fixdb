@@ -42,6 +42,7 @@ FALLBACK AMAN:
 import os
 import asyncio
 import time
+import html
 from datetime import datetime
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -141,13 +142,27 @@ async def _check_vip_bio(chat_id: int, user_id: int, vip_text: str) -> bool:
 
     Alur:
       1. Cek _vip_bio_cache dulu (TTL = BIO_TTL_SECS, sama dengan bio link cache)
-      2. Jika cache miss → baca field "bio" dari dokumen bio_profiles yang SUDAH
-         ada (ditulis bot pemantau saat cek bio link — TIDAK ada API tambahan)
-      3. Cek apakah vip_text ada di bio (case-insensitive)
-      4. Simpan ke cache, return hasil
+      2. Jika cache miss → baca field "bio" dari dokumen bio_profiles yang
+         SUDAH ada (ditulis bot pemantau saat cek bio link — TIDAK ada API
+         tambahan untuk kasus ini)
+      3. Jika dokumen BELUM ADA SAMA SEKALI (user baru pertama kali terlihat,
+         atau cache TTL bio_profiles habis) → PAKSA fetch fresh via bot
+         pemantau (force_check_user), SAMA seperti yang dilakukan
+         _query_bio_for_group() untuk has_link. Tanpa ini, VIP check akan
+         selalu return False palsu pada pesan PERTAMA seorang user — dan
+         karena bio_filter() menjalankan cek VIP SEBELUM cek link, giliran
+         _query_bio_for_group() berikutnya baru memicu fetch (sudah
+         terlambat untuk pesan yang sama) → user dengan teks VIP DAN link
+         sekaligus di bio bisa salah kena hapus/hukum di pesan pertamanya,
+         padahal seharusnya teks VIP mengalahkan deteksi link.
+      4. Cek apakah vip_text ada di bio (case-insensitive)
+      5. Simpan ke cache, return hasil
 
     Dipanggil bersamaan dengan cek bio link di bio_filter() —
-    satu jalan, satu dokumen DB, nol API tambahan.
+    pada user yang sudah punya data di DB, ini tetap 1 jalan / 0 API
+    tambahan seperti sebelumnya; hanya user yang BENAR-BENAR belum punya
+    data sama sekali yang memicu 1x fetch (dan fetch itu juga dipakai
+    ulang oleh _query_bio_for_group() lewat memory cache, tidak dobel).
 
     Return:
       True  → user VIP (bio mengandung vip_text)
@@ -172,9 +187,29 @@ async def _check_vip_bio(chat_id: int, user_id: int, vip_text: str) -> bool:
         return False
 
     if not doc:
-        # Data belum ada — belum dicek oleh bot pemantau
-        # Pengecekan VIP akan dicoba lagi saat bio sudah tersedia
-        return False
+        # Data belum ada (user baru / TTL bio_profiles habis) — PAKSA fetch
+        # fresh sekarang, sama seperti _query_bio_for_group() melakukan untuk
+        # has_link. Tanpa ini, pesan pertama user akan selalu dianggap
+        # "bukan VIP" walau teksnya sudah ada di bio, karena belum pernah
+        # ada yang fetch bio-nya sama sekali.
+        try:
+            from monitor_bot_reference import force_check_user
+            await force_check_user(chat_id, user_id)
+        except Exception as e:
+            print(f"[Bio-VIP] force_check_user gagal chat={chat_id} uid={user_id}: {e}")
+            return False
+
+        try:
+            doc = await bio_col.find_one({"chat_id": chat_id, "user_id": user_id})
+        except Exception as e:
+            print(f"[Bio-VIP] Gagal re-query bio_profiles chat={chat_id} uid={user_id}: {e}")
+            return False
+
+        if not doc:
+            # Bot pemantau tidak aktif / gagal total — tidak ada data sama
+            # sekali. Tidak ada yang bisa dipastikan → anggap belum VIP,
+            # akan dicoba lagi di pesan berikutnya.
+            return False
 
     bio_text = doc.get("bio", "") or ""
     is_vip   = vip_text.lower() in bio_text.lower()
@@ -219,7 +254,7 @@ async def _any_bio_feature_active(chat_id: int) -> bool:
         if cfg.get("bio_check"):
             result = True
         if not result:
-            ns_cfg = await db["ns_config"].find_one({"chat_id": chat_id}) or {}
+            ns_cfg = await db["newscore_config"].find_one({"chat_id": chat_id}) or {}
             if ns_cfg.get("enabled") and ns_cfg.get("bio_admin_required", True) and ns_cfg.get("bio_admin_text", "").strip():
                 result = True
         if not result:
@@ -342,6 +377,18 @@ async def bio_filter(client: Client, message: Message):
                 _update_mem_cache(cid, uid, has_link)
         except Exception:
             pass
+        # FALLBACK BENGKEL: MonitorInstance grup ini tidak aktif/gagal
+        # (belum setup token monitor, atau sedang FloodWait) → coba pool
+        # token backup (workshop_pool). Hasilnya ditulis ke bio_profiles
+        # dengan field sama persis, jadi transparan untuk semua consumer.
+        if has_link is None:
+            try:
+                from core.workshop_pool import workshop_pool
+                has_link = await workshop_pool.check_and_save(cid, uid)
+                if has_link is not None:
+                    _update_mem_cache(cid, uid, has_link)
+            except Exception as e:
+                print(f"[Bio-Filter] Bengkel fallback gagal chat={cid} uid={uid}: {e}")
         # BUG 4+5 FIX: Jika bot pemantau tidak bisa cek (user tidak dikenali/bio kosong)
         # → anggap tidak ada link (bio kosong = no link)
         # → biarkan pesan lewat, jangan hapus tanpa data yang valid
@@ -471,7 +518,21 @@ async def bio_typing_handler(client: Client, update, users, chats):
                     f"→ pre-fetch bio, has_link={result}"
                 )
         except Exception:
-            pass
+            result = None
+        # FALLBACK BENGKEL: sama seperti bio_filter — kalau MonitorInstance
+        # grup ini tidak aktif/gagal, coba pool token backup.
+        if result is None:
+            try:
+                from core.workshop_pool import workshop_pool
+                result = await workshop_pool.check_and_save(chat_id, user_id)
+                if result is not None:
+                    _update_mem_cache(chat_id, user_id, result)
+                    print(
+                        f"[Bio-Typing] uid={user_id} chat={chat_id} "
+                        f"→ pre-fetch bio via Bengkel, has_link={result}"
+                    )
+            except Exception as e:
+                print(f"[Bio-Typing] Bengkel fallback gagal chat={chat_id} uid={user_id}: {e}")
 
     except Exception as e:
         print(f"[Bio-Typing] Error raw handler: {e}")
@@ -500,12 +561,12 @@ async def _log_bio_deletion(client: Client, message: Message):
         "<blockquote>"
         f"🔍 <b>Tipe:</b> Bio Link Detector\n"
         f"◈ <b>User:</b> {user_mention}\n"
-        f"◈ <b>Grup:</b> {message.chat.title} (<code>{cid}</code>)\n"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
         f"◈ <b>Keterangan:</b> Profil bio user mengandung tautan/link\n"
         f"◈ <b>Kebijakan:</b> Pesan dari user berbio link dihapus otomatis\n"
-        f"◈ <b>Bio terdeteksi:</b> <code>{bio_snippet}</code>\n\n"
-        f"📨 <b>Konten pesan:</b>\n<code>{content[:400]}</code>"
+        f"◈ <b>Bio terdeteksi:</b> <code>{html.escape(str(bio_snippet))}</code>\n\n"
+        f"📨 <b>Konten pesan:</b>\n<code>{html.escape(content[:400])}</code>"
         "</blockquote>"
     )
     try:

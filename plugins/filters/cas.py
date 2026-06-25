@@ -19,6 +19,7 @@ VIP:
 import os
 import httpx
 import time
+import html
 import asyncio
 from datetime import datetime
 from pyrogram import Client, filters
@@ -230,12 +231,12 @@ async def _log_cas_ban(client: Client, message: Message, waktu: str):
         "<blockquote>"
         f"🚫 <b>Tipe:</b> Ban Permanen CAS Anti-Spam\n"
         f"◈ <b>User:</b> {user_mention}\n"
-        f"◈ <b>Grup:</b> {message.chat.title} (<code>{cid}</code>)\n"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {waktu}\n"
         f"◈ <b>Sumber verifikasi:</b> Database CAS (cas.chat)\n"
         f"◈ <b>Keterangan:</b> User terdaftar sebagai spammer global terverifikasi\n"
         f"◈ <b>Aksi:</b> Ban permanen + pesan dihapus\n\n"
-        f"📨 <b>Konten saat terdeteksi:</b>\n<code>{content[:500]}</code>"
+        f"📨 <b>Konten saat terdeteksi:</b>\n<code>{html.escape(content[:500])}</code>"
         "</blockquote>"
     )
     await _send_log(client, log_text)
@@ -259,7 +260,7 @@ async def _log_cas_ban_failed(client: Client, message: Message):
         "<blockquote>"
         f"⚠️ <b>Tipe:</b> CAS Ban Gagal Dieksekusi\n"
         f"◈ <b>User:</b> {user_mention}\n"
-        f"◈ <b>Grup:</b> {message.chat.title} (<code>{cid}</code>)\n"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
         f"◈ <b>Keterangan:</b> User terdeteksi spammer CAS, namun ban tidak berhasil\n"
         f"◈ <b>Sebab gagal:</b> Bot bukan admin / tidak punya izin ban member\n"
@@ -275,7 +276,7 @@ async def handle_bot_join(client: Client, message: Message):
     if not message.new_chat_members:
         return
     for member in message.new_chat_members:
-        if member.id == client.me.id: #(await client.get_me()).id:
+        if member.id == client.me.id:
             await update_config(message.chat.id, "local", True)
             try:
                 chat = await client.get_chat(message.chat.id)
@@ -303,7 +304,7 @@ async def handle_bot_join(client: Client, message: Message):
 @Client.on_chat_member_updated()
 async def handle_bot_status_change(client: Client, update):
     try:
-        me = client.me #await client.get_me()
+        me = client.me
         if not update.new_chat_member or update.new_chat_member.user.id != me.id:
             return
 
