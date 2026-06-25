@@ -30,6 +30,8 @@ from pyrogram.enums import ChatMemberStatus
 from dotenv import load_dotenv
 from pathlib import Path as _Path
 
+from core import mongo_shard as _shard
+
 # Cari .env relatif ke file ini, bukan CWD — aman dijalankan dari direktori manapun
 load_dotenv(dotenv_path=_Path(__file__).parent / ".env", override=False)
 
@@ -223,24 +225,44 @@ async def _try_mongo(url: str, db_name: str):
 async def _init_backend():
     """
     Tentukan backend aktif dan inisialisasi koneksi.
-    Urutan: MongoDB → SQLite.
+    Urutan: MongoDB (multi-shard jika MONGO_URL_2, MONGO_URL_3, ... diisi) → SQLite.
+
+    MULTI-SHARD:
+      Setiap MONGO_URL_n di .env dianggap 1 cluster Mongo independen.
+      Semua cluster dicoba konek secara paralel saat startup. Cluster yang
+      gagal konek TIDAK menggagalkan keseluruhan startup — collection yang
+      ter-assign ke shard itu (lihat core/mongo_shard.py) otomatis fallback
+      ke SQLite lokal khusus shard tersebut (_get_sqlite_shard), sementara
+      shard lain yang sehat tetap berjalan normal di MongoDB.
+
+      Jika hanya MONGO_URL terisi (tidak ada MONGO_URL_2 dst) → perilaku
+      identik dengan versi sebelumnya: 1 cluster, tidak ada perubahan.
     """
     global _BACKEND, _mongo_db, _sqlite_conn
 
-    # ── Coba MongoDB ──────────────────────────────────────────────────────────
-    if MONGO_URL:
-        print(f"[DB] 🔍 Mencoba koneksi MongoDB: {MONGO_URL[:40]}...")
-        mongo = await _try_mongo(MONGO_URL, MONGO_DB_NAME)
-        if mongo is not None:
+    urls = _shard.MONGO_URLS
+    if urls:
+        print(f"[DB] 🔍 Mencoba koneksi {len(urls)} shard MongoDB...")
+        results = await asyncio.gather(*[_try_mongo(u, MONGO_DB_NAME) for u in urls])
+        any_ok = False
+        for idx, mongo in enumerate(results):
+            _shard.set_shard_db(idx, mongo)
+            if mongo is not None:
+                any_ok = True
+                tag = f"shard{idx}" if len(urls) > 1 else "MongoDB"
+                print(f"[DB] ✅ {tag} aktif (db={MONGO_DB_NAME})")
+            else:
+                print(f"[DB] ⚠️  shard{idx} gagal konek → fallback SQLite khusus shard ini")
+        if any_ok:
             _BACKEND  = "mongo"
-            _mongo_db = mongo
-            print(f"[DB] ✅ BACKEND AKTIF: MongoDB  (db={MONGO_DB_NAME})")
+            _mongo_db = _shard.get_shard_db(0)   # compat lama: kode yang akses _mongo_db langsung tetap dapat shard utama
+            print(f"[DB] ✅ BACKEND AKTIF: MongoDB  ({_shard.shard_summary()})")
             return
-        print("[DB] ⚠️  MongoDB gagal → fallback ke SQLite")
+        print("[DB] ⚠️  Semua shard MongoDB gagal → fallback total ke SQLite")
     else:
         print("[DB] ℹ️  MONGO_URL tidak ditemukan di .env → pakai SQLite")
 
-    # ── Fallback SQLite ───────────────────────────────────────────────────────
+    # ── Fallback SQLite (penuh, tidak ada shard Mongo yang hidup) ────────────
     _BACKEND = "sqlite"
     _sqlite_conn = await aiosqlite.connect(SQLITE_PATH, check_same_thread=False)
     await _sqlite_conn.execute("PRAGMA journal_mode=WAL")
@@ -302,6 +324,30 @@ async def _get_sqlite() -> aiosqlite.Connection:
         await _sqlite_conn.execute("PRAGMA synchronous=NORMAL")
         _sqlite_conn.row_factory = aiosqlite.Row
     return _sqlite_conn
+
+
+# ── SQLite per-shard (fallback granular saat 1 cluster Mongo down) ───────────
+# Dipakai HANYA oleh collection yang masuk SHARDED_COLLECTIONS saat shard
+# Mongo yang dituju sedang tidak sehat. File terpisah per shard index agar
+# tidak rebutan lock dengan _sqlite_conn (shard 0 / fallback total).
+_shard_sqlite_conns: dict[int, aiosqlite.Connection] = {}
+
+
+async def _get_sqlite_for_shard(idx: int) -> aiosqlite.Connection:
+    if idx == 0:
+        # Shard 0 berbagi file yang sama dengan fallback SQLite lama —
+        # tidak perlu file baru, menjaga kompatibilitas data lama.
+        return await _get_sqlite()
+    global _shard_sqlite_conns
+    conn = _shard_sqlite_conns.get(idx)
+    if conn is None:
+        path = SQLITE_PATH.replace(".db", f".shard{idx}.db") if SQLITE_PATH.endswith(".db") else f"{SQLITE_PATH}.shard{idx}"
+        conn = await aiosqlite.connect(path, check_same_thread=False)
+        await conn.execute("PRAGMA journal_mode=WAL")
+        await conn.execute("PRAGMA synchronous=NORMAL")
+        conn.row_factory = aiosqlite.Row
+        _shard_sqlite_conns[idx] = conn
+    return conn
 
 
 def _tbl(name: str) -> str:
@@ -421,8 +467,8 @@ class AsyncCursor:
         return self
 
     # ── SQLite path ───────────────────────────────────────────────────────────
-    async def _load_sqlite(self):
-        conn = await _get_sqlite()
+    async def _load_sqlite(self, shard_idx: int = 0):
+        conn = await _get_sqlite_for_shard(shard_idx) if _BACKEND == "mongo" else await _get_sqlite()
         tbl  = _tbl(self._col)
         await _ensure_table(conn, self._col)
         async with conn.execute(f"SELECT id, data FROM {tbl} ORDER BY id") as cur:
@@ -437,31 +483,69 @@ class AsyncCursor:
                     docs.append(d)
             except Exception:
                 pass
+        return docs
+
+    def _apply_sort_skip_limit(self, docs: list[dict]) -> list[dict]:
         if self._sort_key:
-            docs.sort(
+            docs = sorted(
+                docs,
                 key=lambda d: (d.get(self._sort_key) or ""),
                 reverse=(self._sort_dir == -1),
             )
         docs = docs[self._skip_n:]
         if self._limit_n is not None:
             docs = docs[:self._limit_n]
-        self._docs = docs
+        return docs
 
     # ── MongoDB path ──────────────────────────────────────────────────────────
     async def _load_mongo(self):
-        col  = _mongo_db[self._col]
-        cur  = col.find(self._query)
-        if self._sort_key:
-            cur = cur.sort(self._sort_key, self._sort_dir)
-        if self._skip_n:
-            cur = cur.skip(self._skip_n)
-        if self._limit_n is not None:
-            cur = cur.limit(self._limit_n)
-        docs = []
-        async for doc in cur:
-            doc["_id"] = str(doc["_id"])
-            docs.append(doc)
-        self._docs = docs
+        bare = _bare_collection_name(self._col)
+        cid  = _shard.extract_chat_id(self._query)
+
+        if bare in _shard.SHARDED_COLLECTIONS and _shard.SHARD_COUNT > 1 and cid is None:
+            # Query tanpa chat_id spesifik → harus baca SEMUA shard dan gabung
+            # (sort/skip/limit diterapkan in-memory setelah gabung, karena
+            # makna "skip 10 limit 20" global lintas shard tidak bisa dipush
+            # secara native ke masing-masing shard tanpa hasil salah).
+            all_docs: list[dict] = []
+            for idx in range(_shard.SHARD_COUNT):
+                col = _mongo_col_for(self._col, idx)
+                if col is not None:
+                    try:
+                        async for doc in col.find(self._query):
+                            doc["_id"] = str(doc["_id"])
+                            all_docs.append(doc)
+                        continue
+                    except Exception as e:
+                        print(f"[DB:mongo] find error {self._col} (shard{idx}): {e}")
+                        _shard.mark_shard_down(idx)
+                all_docs.extend(await self._load_sqlite(idx))
+            self._docs = self._apply_sort_skip_limit(all_docs)
+            return
+
+        shard_idx = _resolve_shard_idx(self._col, self._query)
+        col = _mongo_col_for(self._col, shard_idx)
+        if col is not None:
+            try:
+                cur = col.find(self._query)
+                if self._sort_key:
+                    cur = cur.sort(self._sort_key, self._sort_dir)
+                if self._skip_n:
+                    cur = cur.skip(self._skip_n)
+                if self._limit_n is not None:
+                    cur = cur.limit(self._limit_n)
+                docs = []
+                async for doc in cur:
+                    doc["_id"] = str(doc["_id"])
+                    docs.append(doc)
+                self._docs = docs
+                return
+            except Exception as e:
+                print(f"[DB:mongo] find error {self._col} (shard{shard_idx}): {e}")
+                _shard.mark_shard_down(shard_idx)
+        # fallback sqlite shard ini
+        docs = await self._load_sqlite(shard_idx)
+        self._docs = self._apply_sort_skip_limit(docs)
 
     def __aiter__(self):
         return self
@@ -471,7 +555,7 @@ class AsyncCursor:
             if _BACKEND == "mongo":
                 await self._load_mongo()
             else:
-                await self._load_sqlite()
+                self._docs = self._apply_sort_skip_limit(await self._load_sqlite())
         if self._pos >= len(self._docs):
             raise StopAsyncIteration
         doc       = self._docs[self._pos]
@@ -483,10 +567,59 @@ class AsyncCursor:
             if _BACKEND == "mongo":
                 await self._load_mongo()
             else:
-                await self._load_sqlite()
+                self._docs = self._apply_sort_skip_limit(await self._load_sqlite())
         if length is not None:
             return self._docs[:length]
         return list(self._docs)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SHARD RESOLUTION — pilih cluster Mongo / SQLite yang tepat untuk operasi
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Hanya collection di _shard.SHARDED_COLLECTIONS (lihat core/mongo_shard.py,
+# nama TANPA prefix _ns) yang di-route berdasarkan chat_id. Sisanya selalu
+# memakai shard 0 (cluster utama) — jumlahnya kecil dan tidak perlu dipecah.
+#
+# bare_name: nama collection SEBELUM di-prefix _ns(), karena SHARDED_COLLECTIONS
+# didefinisikan dengan nama generik (mis. "bio_profiles"), bukan
+# "mybot_bio_profiles". Collection.name yang disimpan di __init__ SUDAH
+# di-_ns()-kan oleh DB.__getitem__, jadi kita strip prefix CODE_BOT dulu
+# untuk pencocokan, dengan fallback ke endswith() agar tetap aman.
+
+def _bare_collection_name(ns_name: str) -> str:
+    if _CODE_BOT and ns_name.startswith(_CODE_BOT + "_"):
+        return ns_name[len(_CODE_BOT) + 1:]
+    return ns_name
+
+
+def _resolve_shard_idx(ns_name: str, *dicts: dict) -> int:
+    """Tentukan shard index untuk operasi pada collection ns_name, berdasarkan
+    chat_id yang ditemukan di salah satu dict (query dan/atau doc/update)."""
+    bare = _bare_collection_name(ns_name)
+    if bare not in _shard.SHARDED_COLLECTIONS or _shard.SHARD_COUNT <= 1:
+        return 0
+    for d in dicts:
+        if not isinstance(d, dict):
+            continue
+        # cek langsung, lalu cek di dalam $set (update_one biasa berbentuk {"$set": {...}})
+        cid = _shard.extract_chat_id(d)
+        if cid is None and "$set" in d:
+            cid = _shard.extract_chat_id(d["$set"])
+        if cid is None and "$setOnInsert" in d:
+            cid = _shard.extract_chat_id(d["$setOnInsert"])
+        if cid is not None:
+            return _shard.shard_index_for_chat(cid)
+    return 0  # tidak ada chat_id ditemukan → aman ke shard utama
+
+
+def _mongo_col_for(ns_name: str, shard_idx: int):
+    """Return motor collection object di shard tertentu, atau None jika
+    shard itu sedang tidak sehat (caller harus fallback SQLite shard ini)."""
+    shard_db = _shard.get_shard_db(shard_idx)
+    if shard_db is None or not _shard.is_shard_healthy(shard_idx):
+        return None
+    return shard_db[ns_name]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -501,16 +634,22 @@ class Collection:
 
     async def find_one(self, query: dict = {}) -> dict | None:
         if _BACKEND == "mongo":
-            try:
-                doc = await _mongo_db[self.name].find_one(query)
-                if doc:
-                    doc["_id"] = str(doc["_id"])
-                return doc
-            except Exception as e:
-                print(f"[DB:mongo] find_one error {self.name}: {e}")
-                return None
-        # SQLite
-        conn = await _get_sqlite()
+            shard_idx = _resolve_shard_idx(self.name, query)
+            col = _mongo_col_for(self.name, shard_idx)
+            if col is not None:
+                try:
+                    doc = await col.find_one(query)
+                    if doc:
+                        doc["_id"] = str(doc["_id"])
+                    return doc
+                except Exception as e:
+                    print(f"[DB:mongo] find_one error {self.name} (shard{shard_idx}): {e}")
+                    _shard.mark_shard_down(shard_idx)
+                    # lanjut ke fallback SQLite shard ini di bawah
+            # Shard down / error → fallback SQLite khusus shard ini
+            conn = await _get_sqlite_for_shard(shard_idx)
+        else:
+            conn = await _get_sqlite()
         tbl  = _tbl(self.name)
         await _ensure_table(conn, self.name)
         async with conn.execute(f"SELECT id, data FROM {tbl} ORDER BY id") as cur:
@@ -537,14 +676,18 @@ class Collection:
         self, filter_q: dict, update: dict, upsert: bool = False
     ) -> UpdateResult:
         if _BACKEND == "mongo":
-            try:
-                r = await _mongo_db[self.name].update_one(filter_q, update, upsert=upsert)
-                return UpdateResult(r.matched_count, r.modified_count, str(r.upserted_id) if r.upserted_id else None)
-            except Exception as e:
-                print(f"[DB:mongo] update_one error {self.name}: {e}")
-                return UpdateResult()
-        # SQLite
-        conn = await _get_sqlite()
+            shard_idx = _resolve_shard_idx(self.name, filter_q, update)
+            col = _mongo_col_for(self.name, shard_idx)
+            if col is not None:
+                try:
+                    r = await col.update_one(filter_q, update, upsert=upsert)
+                    return UpdateResult(r.matched_count, r.modified_count, str(r.upserted_id) if r.upserted_id else None)
+                except Exception as e:
+                    print(f"[DB:mongo] update_one error {self.name} (shard{shard_idx}): {e}")
+                    _shard.mark_shard_down(shard_idx)
+            conn = await _get_sqlite_for_shard(shard_idx)
+        else:
+            conn = await _get_sqlite()
         tbl  = _tbl(self.name)
         await _ensure_table(conn, self.name)
         found_id, found_doc = None, None
@@ -584,14 +727,37 @@ class Collection:
 
     async def update_many(self, filter_q: dict, update: dict) -> UpdateResult:
         if _BACKEND == "mongo":
-            try:
-                r = await _mongo_db[self.name].update_many(filter_q, update)
-                return UpdateResult(r.matched_count, r.modified_count)
-            except Exception as e:
-                print(f"[DB:mongo] update_many error {self.name}: {e}")
-                return UpdateResult()
+            bare = _bare_collection_name(self.name)
+            cid  = _shard.extract_chat_id(filter_q)
+            if bare in _shard.SHARDED_COLLECTIONS and _shard.SHARD_COUNT > 1 and cid is None:
+                # Filter tidak menyebut chat_id spesifik (mis. cleanup TTL massal)
+                # → harus menjangkau SEMUA shard, bukan hanya shard 0.
+                total_matched, total_modified = 0, 0
+                for idx in range(_shard.SHARD_COUNT):
+                    col = _mongo_col_for(self.name, idx)
+                    if col is None:
+                        continue
+                    try:
+                        r = await col.update_many(filter_q, update)
+                        total_matched  += r.matched_count
+                        total_modified += r.modified_count
+                    except Exception as e:
+                        print(f"[DB:mongo] update_many error {self.name} (shard{idx}): {e}")
+                        _shard.mark_shard_down(idx)
+                return UpdateResult(total_matched, total_modified)
+            shard_idx = _resolve_shard_idx(self.name, filter_q, update)
+            col = _mongo_col_for(self.name, shard_idx)
+            if col is not None:
+                try:
+                    r = await col.update_many(filter_q, update)
+                    return UpdateResult(r.matched_count, r.modified_count)
+                except Exception as e:
+                    print(f"[DB:mongo] update_many error {self.name} (shard{shard_idx}): {e}")
+                    _shard.mark_shard_down(shard_idx)
+            conn = await _get_sqlite_for_shard(shard_idx)
+        else:
+            conn = await _get_sqlite()
         # SQLite
-        conn = await _get_sqlite()
         tbl  = _tbl(self.name)
         await _ensure_table(conn, self.name)
         async with conn.execute(f"SELECT id, data FROM {tbl}") as cur:
@@ -616,16 +782,20 @@ class Collection:
 
     async def insert_one(self, doc: dict) -> UpdateResult:
         if _BACKEND == "mongo":
-            try:
-                d = dict(doc)
-                d.pop("_id", None)
-                r = await _mongo_db[self.name].insert_one(d)
-                return UpdateResult(upserted_id=str(r.inserted_id))
-            except Exception as e:
-                print(f"[DB:mongo] insert_one error {self.name}: {e}")
-                return UpdateResult()
-        # SQLite
-        conn   = await _get_sqlite()
+            shard_idx = _resolve_shard_idx(self.name, doc)
+            col = _mongo_col_for(self.name, shard_idx)
+            if col is not None:
+                try:
+                    d = dict(doc)
+                    d.pop("_id", None)
+                    r = await col.insert_one(d)
+                    return UpdateResult(upserted_id=str(r.inserted_id))
+                except Exception as e:
+                    print(f"[DB:mongo] insert_one error {self.name} (shard{shard_idx}): {e}")
+                    _shard.mark_shard_down(shard_idx)
+            conn = await _get_sqlite_for_shard(shard_idx)
+        else:
+            conn = await _get_sqlite()
         tbl    = _tbl(self.name)
         await _ensure_table(conn, self.name)
         doc_id = str(doc.get("_id") or uuid.uuid4().hex)
@@ -645,14 +815,18 @@ class Collection:
 
     async def delete_one(self, query: dict) -> DeleteResult:
         if _BACKEND == "mongo":
-            try:
-                r = await _mongo_db[self.name].delete_one(query)
-                return DeleteResult(r.deleted_count)
-            except Exception as e:
-                print(f"[DB:mongo] delete_one error {self.name}: {e}")
-                return DeleteResult()
-        # SQLite
-        conn = await _get_sqlite()
+            shard_idx = _resolve_shard_idx(self.name, query)
+            col = _mongo_col_for(self.name, shard_idx)
+            if col is not None:
+                try:
+                    r = await col.delete_one(query)
+                    return DeleteResult(r.deleted_count)
+                except Exception as e:
+                    print(f"[DB:mongo] delete_one error {self.name} (shard{shard_idx}): {e}")
+                    _shard.mark_shard_down(shard_idx)
+            conn = await _get_sqlite_for_shard(shard_idx)
+        else:
+            conn = await _get_sqlite()
         tbl  = _tbl(self.name)
         await _ensure_table(conn, self.name)
         async with conn.execute(f"SELECT id, data FROM {tbl} ORDER BY id") as cur:
@@ -674,14 +848,33 @@ class Collection:
 
     async def delete_many(self, query: dict = {}) -> DeleteResult:
         if _BACKEND == "mongo":
-            try:
-                r = await _mongo_db[self.name].delete_many(query)
-                return DeleteResult(r.deleted_count)
-            except Exception as e:
-                print(f"[DB:mongo] delete_many error {self.name}: {e}")
-                return DeleteResult()
-        # SQLite
-        conn = await _get_sqlite()
+            bare = _bare_collection_name(self.name)
+            cid  = _shard.extract_chat_id(query)
+            if bare in _shard.SHARDED_COLLECTIONS and _shard.SHARD_COUNT > 1 and cid is None:
+                total = 0
+                for idx in range(_shard.SHARD_COUNT):
+                    col = _mongo_col_for(self.name, idx)
+                    if col is None:
+                        continue
+                    try:
+                        r = await col.delete_many(query)
+                        total += r.deleted_count
+                    except Exception as e:
+                        print(f"[DB:mongo] delete_many error {self.name} (shard{idx}): {e}")
+                        _shard.mark_shard_down(idx)
+                return DeleteResult(total)
+            shard_idx = _resolve_shard_idx(self.name, query)
+            col = _mongo_col_for(self.name, shard_idx)
+            if col is not None:
+                try:
+                    r = await col.delete_many(query)
+                    return DeleteResult(r.deleted_count)
+                except Exception as e:
+                    print(f"[DB:mongo] delete_many error {self.name} (shard{shard_idx}): {e}")
+                    _shard.mark_shard_down(shard_idx)
+            conn = await _get_sqlite_for_shard(shard_idx)
+        else:
+            conn = await _get_sqlite()
         tbl  = _tbl(self.name)
         await _ensure_table(conn, self.name)
         async with conn.execute(f"SELECT id, data FROM {tbl}") as cur:
@@ -708,14 +901,52 @@ class Collection:
         if not docs:
             return
         if _BACKEND == "mongo":
-            try:
-                clean = [{k: v for k, v in d.items() if k != "_id"} for d in docs]
-                await _mongo_db[self.name].insert_many(clean, ordered=False)
-            except Exception as e:
-                print(f"[DB:mongo] insert_many error {self.name}: {e}")
-            return
-        # SQLite
-        conn = await _get_sqlite()
+            bare = _bare_collection_name(self.name)
+            if bare in _shard.SHARDED_COLLECTIONS and _shard.SHARD_COUNT > 1:
+                # Dokumen bisa milik chat_id berbeda-beda → kelompokkan per shard
+                groups: dict[int, list[dict]] = {}
+                for d in docs:
+                    idx = _resolve_shard_idx(self.name, d)
+                    groups.setdefault(idx, []).append(d)
+                for idx, group_docs in groups.items():
+                    col = _mongo_col_for(self.name, idx)
+                    clean = [{k: v for k, v in d.items() if k != "_id"} for d in group_docs]
+                    if col is not None:
+                        try:
+                            await col.insert_many(clean, ordered=False)
+                            continue
+                        except Exception as e:
+                            print(f"[DB:mongo] insert_many error {self.name} (shard{idx}): {e}")
+                            _shard.mark_shard_down(idx)
+                    # fallback sqlite shard ini untuk grup dokumen ini
+                    conn = await _get_sqlite_for_shard(idx)
+                    tbl  = _tbl(self.name)
+                    await _ensure_table(conn, self.name)
+                    for doc in group_docs:
+                        doc_id = str(doc.get("_id") or uuid.uuid4().hex)
+                        dd = dict(doc)
+                        dd["_id"] = doc_id
+                        try:
+                            await conn.execute(
+                                f"INSERT OR IGNORE INTO {tbl} (doc_id, data) VALUES (?, ?)",
+                                (doc_id, _dumps(dd))
+                            )
+                        except Exception:
+                            pass
+                    await conn.commit()
+                return
+            col = _mongo_col_for(self.name, 0)
+            if col is not None:
+                try:
+                    clean = [{k: v for k, v in d.items() if k != "_id"} for d in docs]
+                    await col.insert_many(clean, ordered=False)
+                    return
+                except Exception as e:
+                    print(f"[DB:mongo] insert_many error {self.name}: {e}")
+                    _shard.mark_shard_down(0)
+            conn = await _get_sqlite_for_shard(0)
+        else:
+            conn = await _get_sqlite()
         tbl  = _tbl(self.name)
         await _ensure_table(conn, self.name)
         for doc in docs:
@@ -731,19 +962,125 @@ class Collection:
                 pass
         await conn.commit()
 
+    # ── bulk_write ────────────────────────────────────────────────────────────
+    # NOTE: hanya mendukung pymongo.UpdateOne (cukup untuk kebutuhan saat ini —
+    # ns_flush_score_buffer). Operasi lain (InsertOne/DeleteOne/dst) bisa
+    # ditambahkan kalau ada pemanggil baru yang butuh.
+
+    async def bulk_write(self, ops: list, ordered: bool = False) -> "UpdateResult":
+        """
+        Versi unified dari motor `collection.bulk_write()` — shard-aware untuk
+        MongoDB (operasi dikelompokkan per shard berdasarkan chat_id di
+        filter masing-masing UpdateOne, lalu dieksekusi 1x bulk_write per
+        shard — TETAP 1 round-trip per shard, bukan 1 round-trip per dokumen),
+        dan fallback ke update_one satu-satu untuk SQLite (tidak ada operasi
+        bulk asli di SQLite, tapi volume kasus pakai ini kecil).
+
+        Tanpa method ini, caller yang mengandalkan `collection._col.bulk_write()`
+        langsung (mengasumsikan `Collection` adalah motor collection asli)
+        akan selalu gagal dengan AttributeError, lalu (kalau caller punya
+        fallback naive) jatuh balik ke N kali update_one per flush — yang
+        justru meniadakan tujuan batching ini sama sekali.
+        """
+        from pymongo import UpdateOne as _UpdateOne
+
+        def _op_parts(op):
+            """Ambil (filter, update_doc, upsert) dari UpdateOne secara aman.
+            Pymongo menyimpan ini sebagai atribut privat (_filter/_doc/_upsert,
+            stabil sejak versi 3.x s/d 4.x yang dipakai project ini — lihat
+            requirements.txt), tapi tetap pakai getattr dengan default aman
+            agar tidak crash kalau suatu saat nama atributnya berubah."""
+            f = getattr(op, "_filter", None) or {}
+            d = getattr(op, "_doc", None) or {}
+            u = bool(getattr(op, "_upsert", False))
+            return f, d, u
+
+        total_matched, total_modified, total_upserted = 0, 0, 0
+
+        if _BACKEND == "mongo":
+            bare = _bare_collection_name(self.name)
+            sharded = bare in _shard.SHARDED_COLLECTIONS and _shard.SHARD_COUNT > 1
+
+            groups: dict[int, list] = {}
+            for op in ops:
+                if not isinstance(op, _UpdateOne):
+                    continue  # tipe lain belum didukung — lihat catatan di atas
+                f, d, _u = _op_parts(op)
+                shard_idx = _resolve_shard_idx(self.name, f, d) if sharded else 0
+                groups.setdefault(shard_idx, []).append(op)
+
+            for shard_idx, shard_ops in groups.items():
+                col = _mongo_col_for(self.name, shard_idx)
+                if col is not None:
+                    try:
+                        r = await col.bulk_write(shard_ops, ordered=ordered)
+                        total_matched  += r.matched_count
+                        total_modified += r.modified_count
+                        total_upserted += len(r.upserted_ids or {})
+                        continue
+                    except Exception as e:
+                        print(f"[DB:mongo] bulk_write error {self.name} (shard{shard_idx}): {e}")
+                        _shard.mark_shard_down(shard_idx)
+                # Fallback per-op kalau shard ini down — tetap lebih baik
+                # daripada gagal total untuk seluruh batch.
+                for op in shard_ops:
+                    f, d, u = _op_parts(op)
+                    try:
+                        r = await self.update_one(f, d, upsert=u)
+                        total_matched  += r.matched_count
+                        total_modified += r.modified_count
+                    except Exception as e:
+                        print(f"[DB] bulk_write fallback op error {self.name}: {e}")
+            return UpdateResult(total_matched, total_modified)
+
+        # SQLite: tidak ada operasi bulk asli — terapkan satu-satu lewat
+        # update_one (sudah konsisten dengan jalur SQLite collection lain).
+        for op in ops:
+            if not isinstance(op, _UpdateOne):
+                continue
+            f, d, u = _op_parts(op)
+            try:
+                r = await self.update_one(f, d, upsert=u)
+                total_matched  += r.matched_count
+                total_modified += r.modified_count
+            except Exception as e:
+                print(f"[DB] bulk_write sqlite op error {self.name}: {e}")
+        return UpdateResult(total_matched, total_modified)
+
     # ── count_documents ───────────────────────────────────────────────────────
 
     async def count_documents(self, query: dict = {}) -> int:
         if _BACKEND == "mongo":
-            try:
-                if query:
-                    return await _mongo_db[self.name].count_documents(query)
-                return await _mongo_db[self.name].estimated_document_count()
-            except Exception as e:
-                print(f"[DB:mongo] count_documents error {self.name}: {e}")
-                return 0
-        # SQLite
-        conn = await _get_sqlite()
+            bare = _bare_collection_name(self.name)
+            cid  = _shard.extract_chat_id(query)
+            if bare in _shard.SHARDED_COLLECTIONS and _shard.SHARD_COUNT > 1 and cid is None:
+                total = 0
+                for idx in range(_shard.SHARD_COUNT):
+                    col = _mongo_col_for(self.name, idx)
+                    if col is None:
+                        continue
+                    try:
+                        if query:
+                            total += await col.count_documents(query)
+                        else:
+                            total += await col.estimated_document_count()
+                    except Exception as e:
+                        print(f"[DB:mongo] count_documents error {self.name} (shard{idx}): {e}")
+                        _shard.mark_shard_down(idx)
+                return total
+            shard_idx = _resolve_shard_idx(self.name, query)
+            col = _mongo_col_for(self.name, shard_idx)
+            if col is not None:
+                try:
+                    if query:
+                        return await col.count_documents(query)
+                    return await col.estimated_document_count()
+                except Exception as e:
+                    print(f"[DB:mongo] count_documents error {self.name} (shard{shard_idx}): {e}")
+                    _shard.mark_shard_down(shard_idx)
+            conn = await _get_sqlite_for_shard(shard_idx)
+        else:
+            conn = await _get_sqlite()
         tbl  = _tbl(self.name)
         await _ensure_table(conn, self.name)
         if not query:
@@ -768,19 +1105,30 @@ class Collection:
     ):
         """
         SQLite: no-op (tidak perlu index eksplisit).
-        MongoDB: buat index asli via motor.
+        MongoDB: buat index asli via motor — di SEMUA shard yang relevan untuk
+        collection ini (penting untuk TTL index seperti bio_profiles.expires_at,
+        agar auto-expire bekerja konsisten di tiap cluster, bukan cuma shard 0).
         """
         if _BACKEND == "mongo":
             try:
                 from pymongo import ASCENDING, DESCENDING  # type: ignore
                 if isinstance(keys, str):
                     keys = [(keys, ASCENDING)]
-                await _mongo_db[self.name].create_index(
-                    keys,
-                    unique=unique,
-                    sparse=sparse,
-                    expireAfterSeconds=expireAfterSeconds,
-                )
+                bare = _bare_collection_name(self.name)
+                shard_range = range(_shard.SHARD_COUNT) if (bare in _shard.SHARDED_COLLECTIONS and _shard.SHARD_COUNT > 1) else [0]
+                for idx in shard_range:
+                    col = _mongo_col_for(self.name, idx)
+                    if col is None:
+                        continue
+                    try:
+                        await col.create_index(
+                            keys,
+                            unique=unique,
+                            sparse=sparse,
+                            expireAfterSeconds=expireAfterSeconds,
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -848,8 +1196,10 @@ async def _cleanup_seen_messages():
         try:
             cutoff = time.time() - 86400
             if _BACKEND == "mongo":
-                # PENTING: gunakan _ns() agar cleanup hanya menyentuh namespace CODE_BOT yang aktif
-                await _mongo_db[_ns("seen_messages")].delete_many({"time": {"$lt": cutoff}})
+                # PENTING: pakai Collection (bukan _mongo_db langsung) supaya
+                # cleanup menjangkau SEMUA shard tempat seen_messages tersebar,
+                # bukan hanya shard 0. _ns() tetap diterapkan oleh db[...].
+                await db["seen_messages"].delete_many({"time": {"$lt": cutoff}})
             else:
                 conn = await _get_sqlite()
                 # _ns() sudah diterapkan saat tabel dibuat di setup_db(); pakai nama yang sama
@@ -901,6 +1251,9 @@ async def _migrate_legacy_data():
     migrated_total = 0
 
     if _BACKEND == "mongo":
+        # Catatan: migrasi legacy ini SENGAJA hanya menyentuh shard 0 (_mongo_db
+        # variable lama = shard utama). Data lama (sebelum sharding ada) pasti
+        # semua berada di shard 0, jadi tidak perlu fan-out ke shard lain.
         for col_name in _COLLECTIONS:
             old_col = _mongo_db[col_name]          # collection lama tanpa prefix
             new_col = _mongo_db[_ns(col_name)]     # collection baru dengan prefix
@@ -1280,7 +1633,12 @@ async def reset_code_bot_data(code_bot: str) -> tuple[int, list[str]]:
         for col_name in _ALL_COLS:
             ns = f"{prefix}{col_name}" if prefix else col_name
             try:
-                r = await _mongo_db[ns].delete_many({})
+                # Pakai Collection (lewat DB.__getitem__ tanpa _ns ganda — ns
+                # di sini SUDAH final) supaya delete_many fan-out ke SEMUA
+                # shard untuk collection yang sharded (bio_profiles dkk),
+                # bukan hanya shard 0. _resolve_shard_idx menerima query={}
+                # yang berarti "tanpa chat_id" → otomatis fan-out semua shard.
+                r = await Collection(ns).delete_many({})
                 if r.deleted_count > 0:
                     total += r.deleted_count
                     cleared.append(f"{ns} ({r.deleted_count})")
@@ -1469,7 +1827,7 @@ async def check_bot_permissions(client, chat_id: int) -> bool:
             return has_perms
 
     try:
-        me     = client.me #await client.get_me()
+        me     = client.me
         member = await client.get_chat_member(chat_id, me.id)
         privs  = getattr(member, "privileges", None)
         if privs is None:
@@ -1848,7 +2206,7 @@ async def get_my_admin_groups(client, user_id: int) -> list:
                     UserNotParticipant, ChannelPrivate, ChatForbidden,
                     ChatIdInvalid, PeerIdInvalid,
                 )
-                me = client.me #await client.get_me()
+                me = client.me
                 await client.get_chat_member(chat_id, me.id)
                 # Berhasil → bot masih di grup, lanjutkan
             except Exception as _ve:
@@ -2620,6 +2978,11 @@ async def get_group_action_log_page(
 newscore_stats_db  = db["newscore_stats"]   # skor chat per user per grup
 newscore_admin_db  = db["newscore_admins"]  # riwayat admin aktif yang diangkat
 newscore_cfg_db    = db["newscore_config"]  # konfigurasi newscore per grup
+newscore_titled_db = db["newscore_titled_members"]  # member non-admin yang
+                                             # sedang dipasang tag (Auto Title
+                                             # Member) — dipakai untuk hapus tag
+                                             # otomatis saat member itu tidak lagi
+                                             # masuk daftar titel periode baru.
 
 # ── Cache ns_get_current_admins ───────────────────────────────────────────────
 # ns_get_current_admins dipanggil setiap pesan dari NS admin (untuk cek apakah
@@ -2816,29 +3179,24 @@ async def ns_flush_score_buffer() -> None:
     snapshot = dict(_ns_score_buffer)
     _ns_score_buffer.clear()
 
-    from motor.motor_asyncio import AsyncIOMotorClientSession  # noqa (hanya untuk type hint)
-    ops = []
     try:
         from pymongo import UpdateOne
-        for (chat_id, user_id), data in snapshot.items():
-            ops.append(UpdateOne(
+        ops = [
+            UpdateOne(
                 {"chat_id": chat_id, "user_id": user_id},
-                {"$set":  {"user_name": data["name"]}, "$inc": {"score": data["delta"]}},
+                {"$set": {"user_name": data["name"]}, "$inc": {"score": data["delta"]}},
                 upsert=True,
-            ))
+            )
+            for (chat_id, user_id), data in snapshot.items()
+        ]
         if ops:
-            await newscore_stats_db._col.bulk_write(ops, ordered=False)  # type: ignore[attr-defined]
-    except AttributeError:
-        # Fallback jika newscore_stats_db bukan Motor collection (SQLite backend)
-        for (chat_id, user_id), data in snapshot.items():
-            try:
-                await newscore_stats_db.update_one(
-                    {"chat_id": chat_id, "user_id": user_id},
-                    {"$set":  {"user_name": data["name"]}, "$inc": {"score": data["delta"]}},
-                    upsert=True,
-                )
-            except Exception as e:
-                print(f"[NewsCore] flush fallback error: {e}")
+            # Collection.bulk_write() (lihat database.py) — 1 round-trip per
+            # shard yang relevan, BUKAN 1 round-trip per user seperti versi
+            # lama yang salah asumsi newscore_stats_db punya atribut ._col
+            # (selalu AttributeError → jatuh ke fallback update_one satu-satu,
+            # meniadakan tujuan batching ini). newscore_stats_db sendiri bukan
+            # collection yang di-shard, jadi ini selalu 1 round-trip total.
+            await newscore_stats_db.bulk_write(ops, ordered=False)
     except Exception as e:
         print(f"[NewsCore] flush error: {e}")
         # Kembalikan data ke buffer agar tidak hilang
@@ -2921,6 +3279,22 @@ async def ns_get_current_admins(chat_id: int) -> list:
     return result
 
 
+async def ns_is_current_admin(chat_id: int, user_id: int) -> bool:
+    """
+    True jika user_id adalah admin NewsCore AKTIF di grup ini saat ini.
+
+    Dipakai untuk MELARANG admin NewsCore menjadi VIP (baik manual /vip
+    maupun otomatis via teks bio) — supaya admin NewsCore tidak pernah bisa
+    lolos dari pengecekan "Bio Admin Wajib" hanya karena kebetulan (atau
+    disengaja) bio-nya juga memenuhi teks VIP Bio grup yang sama.
+    """
+    try:
+        admins = await ns_get_current_admins(chat_id)
+        return user_id in {a["user_id"] for a in admins}
+    except Exception:
+        return False
+
+
 def invalidate_ns_admins_cache(chat_id: int) -> None:
     """Hapus cache ns_get_current_admins untuk grup tertentu.
     Dipanggil setelah ns_set_current_admins() atau ns_remove_admin()
@@ -2946,6 +3320,37 @@ async def ns_remove_admin(chat_id: int, user_id: int) -> None:
         invalidate_ns_admins_cache(chat_id)
     except Exception as e:
         print(f"[NewsCore] remove admin error: {e}")
+
+
+async def ns_get_titled_members(chat_id: int) -> list:
+    """
+    Ambil daftar member non-admin yang SEDANG dipasang tag (Auto Title
+    Member) di grup ini dari periode reset sebelumnya.
+
+    Dipakai _apply_auto_title_member() untuk membandingkan dengan daftar
+    titel baru — siapa yang TIDAK lagi masuk daftar baru akan dihapus
+    tag-nya (setChatMemberTag dengan tag="").
+    """
+    try:
+        return await newscore_titled_db.find({"chat_id": chat_id}).to_list(length=200)
+    except Exception as e:
+        print(f"[NewsCore] get titled members error: {e}")
+        return []
+
+
+async def ns_set_titled_members(chat_id: int, members: list) -> None:
+    """
+    Timpa daftar member bertitel grup ini dengan daftar baru.
+    `members` adalah list of dict {"chat_id", "user_id", "user_name", "tag"}.
+    Dipanggil SETELAH semua setChatMemberTag (pasang baru + hapus lama)
+    selesai dieksekusi di akhir periode reset.
+    """
+    try:
+        await newscore_titled_db.delete_many({"chat_id": chat_id})
+        if members:
+            await newscore_titled_db.insert_many(members)
+    except Exception as e:
+        print(f"[NewsCore] set titled members error: {e}")
 
 
 async def ns_remove_score(chat_id: int, user_id: int) -> None:

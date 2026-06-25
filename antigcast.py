@@ -731,6 +731,15 @@ async def graceful_shutdown():
     except Exception as e:
         print(f"[Shutdown] ⚠️  Gagal simpan/stop session userbot: {e}")
 
+    # Bengkel: putus semua koneksi token backup. Tidak ada session penting
+    # yang perlu dibackup di sini — token backup tidak menyimpan peer cache
+    # grup manapun (stateless, hanya dipakai sesaat untuk GetFullUser).
+    try:
+        from core.workshop_pool import workshop_pool
+        await workshop_pool.stop_all()
+    except Exception as e:
+        print(f"[Shutdown] ⚠️  Gagal stop Bengkel: {e}")
+
     await _notify_owner()
 
     current = asyncio.current_task()
@@ -768,6 +777,18 @@ async def main():
 
     # Setup database (auto-pilih MongoDB atau SQLite)
     await setup_db()
+
+    # ── Bengkel: login semua token backup GetFullUser di background ─────────
+    # TIDAK di-await — login N token backup tidak boleh menunda app.start()
+    # bot utama. Kalau Bengkel belum siap saat request pertama datang,
+    # check_and_save() akan lazy-start sendiri (lihat workshop_pool.py).
+    try:
+        from core.workshop_pool import workshop_pool
+        if workshop_pool.size > 0:
+            asyncio.create_task(workshop_pool.start_all())
+            print(f"[Workshop] 🔧 {workshop_pool.size} token backup terdeteksi, login di background...")
+    except Exception as e:
+        print(f"[Workshop] Gagal inisialisasi pool: {e}")
 
     # ── Deploy Handshake ──────────────────────────────────────────────────────
     # Sinyal ke instance lama bahwa deploy baru siap — tunggu sampai instance lama
@@ -900,6 +921,13 @@ async def main():
             asyncio.create_task(newscore_checker_loop(app))
         except Exception as e:
             print(f"[Startup] ⚠️  newscore_checker_loop gagal dimulai: {e}")
+
+        # ── NewsCore Bio Admin Sweep Loop (inspeksi berkala jam 03:00 WIB) ────
+        try:
+            from plugins.commands.newscore import newscore_bio_sweep_loop
+            asyncio.create_task(newscore_bio_sweep_loop(app))
+        except Exception as e:
+            print(f"[Startup] ⚠️  newscore_bio_sweep_loop gagal dimulai: {e}")
 
         # ── VIP Bio Checker Loop (auto-keluar VIP saat teks hilang dari bio) ──
         try:
