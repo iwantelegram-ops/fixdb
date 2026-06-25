@@ -23,7 +23,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.enums import ParseMode
 from pyrogram.errors import MessageNotModified, MessageIdInvalid, FloodWait
 
-from database import db, invalidate_count_cache, update_config as _db_update_config
+from database import db, invalidate_count_cache, update_config as _db_update_config, ns_is_current_admin
 from plugins.ui.pages import (
     page_regex_list, page_regex_tutorial,
     page_whitelist_text, page_free_list,
@@ -173,8 +173,8 @@ async def _handle_regex_input(client, message: Message, user_id: int, state: dic
     except (ValueError, re.error) as e:
         err = await message.reply(
             f"❌ <b>ERROR</b>\n\n"
-            f"Input tidak dikenali:\n<code>{raw_input}</code>\n"
-            f"<b>Keterangan:</b> <code>{e}</code>\n\n"
+            f"Input tidak dikenali:\n<code>{_html_escape(raw_input)}</code>\n"
+            f"<b>Keterangan:</b> <code>{_html_escape(str(e))}</code>\n\n"
             f"<i>Contoh: <code>togel</code> atau <code>jual | akun</code></i>",
             parse_mode=ParseMode.HTML,
         )
@@ -214,7 +214,7 @@ async def _handle_regex_input(client, message: Message, user_id: int, state: dic
     invalidate_count_cache(chat_id)  # refresh jumlah filter di panel
 
     text, keyboard = await page_regex_list(chat_id, 1)
-    kata_str = " + ".join(f"<code>{k}</code>" for k in kata_list) if kata_list else f"<code>{raw_input}</code>"
+    kata_str = " + ".join(f"<code>{_html_escape(k)}</code>" for k in kata_list) if kata_list else f"<code>{_html_escape(raw_input)}</code>"
     header = (
         f"✅ <b>Filter Kata Berhasil Ditambahkan!</b>\n"
         f"◈ <b>Kata Kunci:</b> {kata_str}\n"
@@ -242,6 +242,25 @@ async def _handle_free_input(client, message: Message, user_id: int, state: dict
     msg_id    = state["msg_id"]
 
     _cancel_task(pending_free_state.pop(user_id, None))
+
+    # ── Larang admin NewsCore jadi VIP (sama seperti perintah /vip) ─────────
+    # Lihat alasan lengkap di plugins/commands/free.py — kalau admin NewsCore
+    # bisa VIP, dia lolos dari semua filter termasuk efek bio guard NewsCore.
+    if await ns_is_current_admin(chat_id, target_id):
+        text, keyboard = await page_free_list(chat_id)
+        header = (
+            f"⚠️ <b>User <code>{target_id}</code> adalah admin NewsCore aktif</b> "
+            f"— tidak bisa dijadikan VIP.\n"
+            f"Copot status admin NewsCore-nya dulu (reset periode atau bio guard) "
+            f"baru bisa di-VIP-kan.\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+        await _safe_edit_id(client, message.chat.id, msg_id, header + text, keyboard)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return
 
     await free_col.update_one(
         {"user_id": target_id, "chat_id": chat_id},

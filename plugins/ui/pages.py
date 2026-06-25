@@ -79,7 +79,7 @@ async def _fetch_owner_line(client) -> str:
 
 
 async def page_start(client):
-    me      = client.me #await client.get_me()
+    me      = client.me
     add_url = f"t.me/{me.username}?startgroup=true&admin=delete_messages+ban_users"
 
     owner_line = await _fetch_owner_line(client)

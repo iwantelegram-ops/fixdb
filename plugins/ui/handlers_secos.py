@@ -160,7 +160,7 @@ async def cb_secos_setmon(client: Client, cb: CallbackQuery):
     try:
         from video_call import userbot as _ub
         if _ub:
-            _ub_me = await _ub.get_me()
+            _ub_me = _ub.me
             ub_uname = _ub_me.username or ""
     except Exception:
         pass
@@ -327,7 +327,7 @@ async def handle_setmon_input(client: Client, message: Message):
     try:
         from video_call import userbot as _ub2
         if _ub2:
-            _ub_me2 = await _ub2.get_me()
+            _ub_me2 = _ub2.me
             _ub_uname_success = _ub_me2.username or ""
     except Exception:
         pass

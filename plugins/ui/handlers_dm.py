@@ -13,6 +13,7 @@ PERUBAHAN (v2 — admin_session):
 """
 
 import re
+import html
 import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
@@ -292,7 +293,7 @@ async def cb_admin_menu(client, cb: CallbackQuery):
     await safe_edit(
         cb.message,
         f"<b>❖ ＤＡＦＴＡＲ ＧＲＵＰ ❖</b>\n\n"
-        f"Halo komandan <b>{cb.from_user.first_name}</b>!\n\n"
+        f"Halo komandan <b>{html.escape(cb.from_user.first_name or str(cb.from_user.id))}</b>!\n\n"
         f"Sistem mendeteksi Anda memiliki otoritas di <b>{len(groups)} grup</b>. "
         f"Pilih grup yang ingin Anda kelola keamanannya di bawah ini:",
         InlineKeyboardMarkup(buttons)
@@ -515,7 +516,7 @@ async def cb_bio_vip_set(client, cb: CallbackQuery):
 
         cfg      = await get_config(chat_id)
         vip_text = (cfg.get("bio_vip_text") or "").strip()
-        current  = f"\n\n🔵 <b>Teks aktif saat ini:</b> <code>{vip_text[:80]}</code>" if vip_text else ""
+        current  = f"\n\n🔵 <b>Teks aktif saat ini:</b> <code>{html.escape(vip_text[:80])}</code>" if vip_text else ""
 
         msg = await cb.message.edit(
             f"✏️ <b>ATUR TEKS VIP BIO</b>\n"
