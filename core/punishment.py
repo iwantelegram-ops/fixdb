@@ -24,6 +24,7 @@ API Publik:
 import os
 import asyncio
 import time
+import html
 from datetime import datetime, timedelta, timezone
 
 from pyrogram.enums import ParseMode
@@ -92,10 +93,11 @@ async def check_and_punish(
             return
 
         # Beri tahu grup (pesan singkat, hapus 10 detik)
+        spam_type_safe = html.escape(spam_type)
         notif = await send_group_notice(
             client, cid,
             f"{message.from_user.mention} di-mute {duration_min} menit "
-            f"karena {spam_type} berulang.",
+            f"karena {spam_type_safe} berulang.",
             notice_kind="mute",
             parse_mode=ParseMode.HTML,
         )
@@ -124,15 +126,16 @@ async def _log_mute_failed(client, message, spam_type: str) -> None:
 
     # Detail alasan per jenis pelanggaran
     detail = _mute_detail(spam_type)
+    spam_type_safe = html.escape(spam_type)
 
     log_text = (
         "<b>❖ MUTE GAGAL — IZIN BOT TIDAK CUKUP ❖</b>\n"
         "<blockquote>"
         f"⚠️ <b>Tipe:</b> Eksekusi Mute Gagal\n"
         f"◈ <b>User:</b> {user_mention}\n"
-        f"◈ <b>Grup:</b> {message.chat.title} (<code>{cid}</code>)\n"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
-        f"◈ <b>Pemicu:</b> {spam_type} — 10× berturut-turut\n"
+        f"◈ <b>Pemicu:</b> {spam_type_safe} — 10× berturut-turut\n"
         f"{detail}\n"
         f"◈ <b>Sebab gagal:</b> Bot bukan admin / tidak punya izin restrict\n"
         f"<i>Pesan user tidak dianggap masa mute — cek izin admin bot di grup ini.</i>"
@@ -156,7 +159,7 @@ def _mute_detail(spam_type: str) -> str:
     for k, v in _map.items():
         if k in key:
             return v
-    return f"◈ <b>Keterangan:</b> Pelanggaran <i>{spam_type}</i> mencapai ambang batas"
+    return f"◈ <b>Keterangan:</b> Pelanggaran <i>{html.escape(spam_type)}</i> mencapai ambang batas"
 
 
 async def _log_mute(
@@ -187,18 +190,19 @@ async def _log_mute(
 
     user_mention = _user_line(uid, user_name)
     detail       = _mute_detail(spam_type)
+    spam_type_safe = html.escape(spam_type)
 
     log_text = (
         "<b>❖ MUTE OTOMATIS — AMBANG SPAM TERCAPAI ❖</b>\n"
         "<blockquote>"
         f"🔇 <b>Tipe:</b> Mute Otomatis Anti-Spam\n"
         f"◈ <b>User:</b> {user_mention}\n"
-        f"◈ <b>Grup:</b> {message.chat.title} (<code>{cid}</code>)\n"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
         f"◈ <b>Durasi:</b> {duration_min} menit\n"
-        f"◈ <b>Pemicu:</b> {spam_type} — 10× berturut-turut\n"
+        f"◈ <b>Pemicu:</b> {spam_type_safe} — 10× berturut-turut\n"
         f"{detail}\n\n"
-        f"📨 <b>Konten terakhir:</b>\n<code>{konten[:300]}</code>"
+        f"📨 <b>Konten terakhir:</b>\n<code>{html.escape(konten[:300])}</code>"
         "</blockquote>"
     )
     await _send_log(client, log_text)

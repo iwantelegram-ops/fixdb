@@ -71,7 +71,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from database import db, get_config, reset_local_mute, config_db
+from database import db, get_config, reset_local_mute, config_db, ns_is_current_admin
 
 free_col = db["free_per_group"]
 bio_col  = db["bio_profiles"]
@@ -101,6 +101,16 @@ async def maybe_enter_vip_bio(client, chat_id: int, user_id: int) -> bool:
         if existing is not None:
             # Sudah VIP (entah lewat bio atau manual) — tidak ada yang perlu
             # dilakukan. Tidak menulis ulang/mengubah source yang sudah ada.
+            return False
+
+        # ── Larang admin NewsCore masuk VIP lewat teks bio ──────────────────
+        # Kalau teks VIP Bio kebetulan (atau disengaja) sama/cocok dengan
+        # teks "Bio Admin Wajib" NewsCore, admin NewsCore bisa otomatis
+        # lolos jadi VIP — dan begitu VIP, dia bebas dari semua filter,
+        # termasuk efek praktis dari bio guard NewsCore. Untuk mencegah ini,
+        # admin NewsCore TIDAK PERNAH didaftarkan VIP lewat jalur otomatis
+        # ini, apapun isi bionya.
+        if await ns_is_current_admin(chat_id, user_id):
             return False
 
         _entering.add(key)
