@@ -11,7 +11,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.enums import ParseMode
 
-from database import db, is_admin, auto_delete_reply
+from database import db, is_admin, auto_delete_reply, ns_is_current_admin
 
 DELAY  = 10
 free_col = db["free_per_group"]
@@ -39,6 +39,23 @@ async def cmd_vip(client: Client, message: Message):
     if target is None:
         res = await message.reply(
             "⚠️ Cara pakai: reply pesan user atau <code>/vip ID</code>",
+            parse_mode=ParseMode.HTML
+        )
+        asyncio.create_task(auto_delete_reply([res, message], delay=DELAY))
+        return
+
+    # ── Larang admin NewsCore jadi VIP ──────────────────────────────────────
+    # Admin NewsCore wajib tetap kena cek "Bio Admin Wajib". Kalau dia juga
+    # VIP, semua filter (termasuk jalur yang memicu enforce_admin_bio) akan
+    # melewatkannya — bio wajib jadi tidak pernah ditegakkan selama dia
+    # masih admin NewsCore. Harus /unadmin dulu (lewat reset NewsCore atau
+    # bio guard) sebelum bisa di-VIP-kan manual.
+    if await ns_is_current_admin(cid, target):
+        res = await message.reply(
+            "⚠️ <code>{}</code> adalah admin NewsCore aktif — tidak bisa dijadikan VIP.\n"
+            "Admin NewsCore wajib tetap kena cek Bio Admin Wajib. "
+            "Copot status admin NewsCore-nya dulu (lewat reset periode atau "
+            "otomatis via bio guard) baru bisa di-VIP-kan.".format(target),
             parse_mode=ParseMode.HTML
         )
         asyncio.create_task(auto_delete_reply([res, message], delay=DELAY))

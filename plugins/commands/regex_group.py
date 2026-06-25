@@ -1,5 +1,6 @@
 import asyncio
 import re
+import html
 import unicodedata
 
 """
@@ -70,8 +71,8 @@ async def add_group_regex(client: Client, message):
         res = await message.reply(
             f"<b>❖ ERROR ❖</b>\n\n"
             f"❌ <b>Input Gagal Diproses!</b>\n"
-            f"◈ <b>Input:</b> <code>{raw_input}</code>\n"
-            f"◈ <b>Keterangan:</b> <code>{e}</code>",
+            f"◈ <b>Input:</b> <code>{html.escape(raw_input)}</code>\n"
+            f"◈ <b>Keterangan:</b> <code>{html.escape(str(e))}</code>",
             parse_mode=ParseMode.HTML
         )
         asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
@@ -103,7 +104,7 @@ async def add_group_regex(client: Client, message):
     except Exception:
         pass
 
-    kata_str = " + ".join(f"<code>{k}</code>" for k in kata_list)
+    kata_str = " + ".join(f"<code>{html.escape(k)}</code>" for k in kata_list)
     res = await message.reply(
         f"<b>❖ FILTER KATA DITAMBAHKAN ❖</b>\n\n"
         f"✅ <b>Filter Khusus Grup Berhasil Tersimpan!</b>\n"
@@ -158,7 +159,7 @@ async def del_group_regex(client: Client, message):
             pass
         res = await message.reply(
             f"🗑️ <b>Filter Grup Berhasil Dihapus!</b>\n"
-            f"◈ <b>Kata:</b> <code>{raw_input}</code>",
+            f"◈ <b>Kata:</b> <code>{html.escape(raw_input)}</code>",
             parse_mode=ParseMode.HTML
         )
     else:
@@ -180,7 +181,7 @@ async def list_group_regex(client: Client, message):
     docs = [doc async for doc in group_regex_db.find({"chat_id": cid})]
 
     if docs:
-        lines = "\n".join(f"  ◈ <b>{doc.get('raw', '—')}</b>" for doc in docs)
+        lines = "\n".join(f"  ◈ <b>{html.escape(str(doc.get('raw', '—')))}</b>" for doc in docs)
         text  = (
             "<b>❖ FILTER KATA GRUP ❖</b>\n"
             f"⚡ <b>Total Aktif:</b> <code>{len(docs)} Pola</code>\n\n"

@@ -25,6 +25,7 @@ from database import (
     ns_get_current_admins, ns_set_current_admins,
     ns_get_active_user_count, ns_flush_score_buffer,
     ns_remove_score, invalidate_ns_admins_cache,
+    ns_get_titled_members, ns_set_titled_members,
     HARI_MAP_NS, is_admin, TZ_WIB, delete_queue,
 )
 from plugins.ui.handlers_fsm import _truncate_to_utf16_limit
@@ -32,6 +33,35 @@ from core.member_tag import set_chat_member_tag
 
 import os
 _OWNER_ID = int(os.environ.get("OWNER_ID", 0))
+
+
+async def _revoke_vip_on_ns_promote(chat_id: int, user_id: int) -> None:
+    """
+    Hapus status VIP (manual maupun bio_vip) dari member yang BARU SAJA
+    diangkat jadi admin NewsCore.
+
+    KENAPA PERLU: kalau member sudah VIP duluan (lewat /vip atau teks bio)
+    lalu kemudian terpilih jadi admin NewsCore lewat skor leaderboard, status
+    VIP lamanya akan tetap nyangkut kalau tidak dibersihkan di sini — padahal
+    admin NewsCore wajib bisa kena tindak "Bio Admin Wajib", dan status VIP
+    membuatnya bebas dari semua filter lain juga (efek yang tidak diinginkan
+    untuk pemegang jabatan admin). Pencegahan di sisi MASUK VIP (/vip, panel,
+    teks bio) sudah ada — fungsi ini menutup arah sebaliknya: member yang
+    SUDAH VIP DULU, baru kemudian jadi admin NewsCore.
+    """
+    try:
+        from database import db
+        free_col = db["free_per_group"]
+        result = await free_col.delete_one({"chat_id": chat_id, "user_id": user_id})
+        if result.deleted_count:
+            print(f"[NewsCore] uid={user_id} chat={chat_id} → VIP lama dicabut (sekarang admin NewsCore)")
+            try:
+                from video_call import invalidate_vip_cache
+                invalidate_vip_cache(chat_id, user_id)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[NewsCore] gagal cabut VIP uid={user_id} chat={chat_id}: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,7 +152,7 @@ async def cmd_ns_score(client, message: Message):
             return
 
         lines = "".join(
-            f"{i}. <b>{m['user_name']}</b> — <code>{m['score']}</code> poin\n"
+            f"{i}. <b>{_html_escape(str(m['user_name']))}</b> — <code>{m['score']}</code> poin\n"
             for i, m in enumerate(top, 1)
         )
 
@@ -183,6 +213,14 @@ async def _apply_auto_title_member(
     -> cover rank 1-50). Dipanggil dari ns_do_reset(), terpisah dari logika
     pengangkatan admin di atas.
 
+    PEMBERSIHAN TITEL LAMA (penting):
+    Member yang dititel periode SEBELUMNYA tapi TIDAK lagi masuk daftar
+    kandidat titel periode BARU akan di-hapus tag-nya (setChatMemberTag
+    dengan tag=""). Daftar member bertitel disimpan di newscore_titled_db
+    (ns_get_titled_members / ns_set_titled_members) justru supaya
+    perbandingan lama-vs-baru ini bisa dilakukan tiap reset, walau owner
+    mematikan/menyalakan fitur ini di antara periode.
+
     admin_ids: kumpulan user_id yang BARU diangkat admin periode ini.
                Mereka di-exclude dari pemberian tag member karena:
                1. Mereka adalah admin (setChatMemberTag hanya untuk non-admin).
@@ -195,13 +233,37 @@ async def _apply_auto_title_member(
 
     Returns ringkasan singkat (string) untuk disisipkan ke pengumuman reset,
     atau "" jika fitur tidak aktif / tidak ada nama diisi / tidak ada member
-    yang memenuhi syarat.
+    yang memenuhi syarat DAN tidak ada titel lama yang perlu dibersihkan.
     """
-    if not cfg.get("auto_title_enabled", False):
-        return ""
-
+    auto_title_active = cfg.get("auto_title_enabled", False)
     names = [n for n in cfg.get("auto_title_names", []) if n and n.strip()]
-    if not names:
+
+    # Titel lama dari periode sebelumnya — dibaca terlepas dari status aktif
+    # sekarang, supaya kalau owner baru MEMATIKAN fitur ini, titel yang sudah
+    # terpasang tetap dibersihkan pada reset berikutnya (bukan dibiarkan
+    # nyangkut selamanya).
+    old_titled = await ns_get_titled_members(chat_id)
+    old_titled_by_uid = {m["user_id"]: m for m in old_titled}
+
+    if not auto_title_active or not names:
+        # Fitur OFF (atau belum diisi nama) → tidak pasang titel baru,
+        # tapi tetap bersihkan SEMUA titel lama yang masih nyangkut.
+        if not old_titled:
+            return ""
+        cleared = 0
+        for idx, m in enumerate(old_titled):
+            uid = m["user_id"]
+            if idx > 0:
+                await asyncio.sleep(_NS_ACTION_DELAY)
+            try:
+                success, _ = await set_chat_member_tag(chat_id, uid, "")
+                if success:
+                    cleared += 1
+            except Exception as e:
+                print(f"[NewsCore][AutoTitle] gagal hapus tag lama uid={uid}: {e}")
+        await ns_set_titled_members(chat_id, [])
+        if cleared:
+            return f"\n\n🏷️ <b>Auto Title Member:</b> nonaktif — <code>{cleared}</code> titel lama dibersihkan."
         return ""
 
     # Butuh leaderboard sampai cover seluruh kelompok nama yang diisi
@@ -215,15 +277,13 @@ async def _apply_auto_title_member(
     # Admin tidak boleh dapat tag member — Telegram API akan menolak.
     candidates = [w for w in full_board if w["user_id"] not in admin_ids][:pool_size]
 
-    if not candidates:
-        return ""
-
-    ok_count, fail_count = 0, 0
-    fail_samples = []
-
-    # Jeda awal (stagger antar grup)
     if base_delay > 0:
         await asyncio.sleep(base_delay)
+
+    # ── Bangun daftar titel BARU (rank → nama tag) ────────────────────────
+    new_titled: dict[int, dict] = {}
+    ok_count, fail_count = 0, 0
+    fail_samples = []
 
     for idx, w in enumerate(candidates):
         group_idx = idx // 5  # 0 = rank 1-5, 1 = rank 6-10, dst
@@ -239,16 +299,51 @@ async def _apply_auto_title_member(
         success, reason = await set_chat_member_tag(chat_id, uid, tag)
         if success:
             ok_count += 1
+            new_titled[uid] = {
+                "chat_id": chat_id, "user_id": uid,
+                "user_name": w.get("user_name", str(uid)), "tag": tag,
+            }
         else:
             fail_count += 1
             if len(fail_samples) < 3:
                 fail_samples.append(f"{w.get('user_name', uid)}: {reason}")
             print(f"[NewsCore][AutoTitle] gagal uid={uid} tag={tag!r}: {reason}")
+            # Tetap dianggap "masih bertitel sesuai data lama" jika gagal
+            # diupdate — supaya tidak salah dibersihkan di reset berikutnya
+            # hanya karena satu kegagalan API sesaat. Jika user ini memang
+            # ada di old_titled, biarkan dia tetap tercatat dengan tag baru
+            # yang seharusnya (agar percobaan berikutnya bisa retry natural
+            # lewat reset selanjutnya); jika tidak ada di old_titled, lewati.
+            if uid in old_titled_by_uid:
+                new_titled[uid] = {
+                    "chat_id": chat_id, "user_id": uid,
+                    "user_name": w.get("user_name", str(uid)), "tag": tag,
+                }
 
-    if ok_count == 0 and fail_count == 0:
+    # ── Hapus tag dari member LAMA yang TIDAK lagi masuk daftar baru ──────
+    stale_uids = [uid for uid in old_titled_by_uid if uid not in new_titled]
+    cleared_count = 0
+    for idx, uid in enumerate(stale_uids):
+        if idx > 0 or new_titled:
+            await asyncio.sleep(_NS_ACTION_DELAY)
+        try:
+            success, reason = await set_chat_member_tag(chat_id, uid, "")
+            if success:
+                cleared_count += 1
+            else:
+                print(f"[NewsCore][AutoTitle] gagal hapus tag lama uid={uid}: {reason}")
+        except Exception as e:
+            print(f"[NewsCore][AutoTitle] gagal hapus tag lama uid={uid}: {e}")
+
+    # ── Simpan daftar bertitel terbaru ke DB ──────────────────────────────
+    await ns_set_titled_members(chat_id, list(new_titled.values()))
+
+    if ok_count == 0 and fail_count == 0 and cleared_count == 0:
         return ""
 
     summary = f"\n\n🏷️ <b>Auto Title Member:</b> <code>{ok_count}</code> member ditandai otomatis."
+    if cleared_count:
+        summary += f" <code>{cleared_count}</code> titel lama dibersihkan (tidak masuk daftar baru)."
     if fail_count:
         summary += (
             f"\n⚠️ <code>{fail_count}</code> gagal — kemungkinan bot belum "
@@ -420,19 +515,23 @@ async def _ns_do_reset_impl(client, chat_id: int):
                         if not title_ok:
                             print(f"[NewsCore] set_custom_title MENYERAH uid={uid} title={title!r}")
                         new_admin_docs.append({"chat_id": chat_id, "user_id": uid, "user_name": uname})
+                        # Member ini sekarang admin NewsCore — pastikan status
+                        # VIP lama (kalau ada) tidak nyangkut, supaya bio guard
+                        # NewsCore tetap bisa menindaknya secara normal.
+                        await _revoke_vip_on_ns_promote(chat_id, uid)
                         title_note = "" if title_ok else " (⚠️ titel gagal dipasang)"
-                        ann += f"{idx}. <a href='tg://user?id={uid}'>{uname}</a> — <code>{w['score']}</code> poin{title_note}\n"
+                        ann += f"{idx}. <a href='tg://user?id={uid}'>{_html_escape(uname)}</a> — <code>{w['score']}</code> poin{title_note}\n"
                         break
                     except FloodWait as fw:
                         await asyncio.sleep(fw.value + 1)
                         continue
                     except Exception as e:
                         print(f"[NewsCore] promote error uid={uid}: {e}")
-                        ann += f"{idx}. <b>{uname}</b> (⚠️ gagal dipromosikan)\n"
+                        ann += f"{idx}. <b>{_html_escape(uname)}</b> (⚠️ gagal dipromosikan)\n"
                         break
                 else:
                     print(f"[NewsCore] promote uid={uid} gagal setelah retry FloodWait")
-                    ann += f"{idx}. <b>{uname}</b> (⚠️ gagal dipromosikan — FloodWait)\n"
+                    ann += f"{idx}. <b>{_html_escape(uname)}</b> (⚠️ gagal dipromosikan — FloodWait)\n"
         else:
             ann += "Tidak ada aktivitas periode ini. Posisi admin tetap. 🏝️"
 
@@ -536,6 +635,120 @@ async def newscore_checker_loop(client):
 
         except Exception as e:
             print(f"[NewsCore] checker error: {e}")
+        await asyncio.sleep(30)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SWEEP BERKALA: INSPEKSI BIO ADMIN NEWSCORE (jam 03:00 WIB)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# TUJUAN:
+#   _check_ns_admin_bio (plugins/filters/bio.py) hanya tertrigger reaktif —
+#   saat admin NewsCore mengirim pesan atau typing. Admin yang sudah
+#   diangkat lalu DIAM (tidak chat lagi) atau yang mengubah/menghapus bio
+#   setelah diangkat tidak akan pernah dicek ulang sampai dia kembali aktif.
+#   Sweep ini menutup celah itu dengan memaksa cek bio fresh (via bot
+#   pembantu/monitor) untuk SEMUA admin NewsCore aktif, di SEMUA grup yang
+#   NewsCore-nya aktif & punya admin NewsCore — bergiliran, 1x per hari.
+#
+# RATE-LIMIT SAFE:
+#   - Hanya grup yang punya admin NewsCore aktif yang diproses (skip grup
+#     kosong → tidak buang waktu/API).
+#   - Bergiliran (1 grup diproses penuh dulu) dengan jeda antar grup
+#     maupun antar user — tidak burst ke Telegram / bot pembantu.
+#   - force_check_user() tetap lewat _bio_worker per-grup (rate-limited,
+#     FloodWait-aware) — sweep ini tidak bypass mekanisme itu.
+#   - enforce_admin_bio() sendiri sudah punya cooldown internal, aman
+#     dipanggil berulang.
+
+_NS_BIO_SWEEP_HOUR   = int(os.environ.get("NS_BIO_SWEEP_HOUR", 3))
+_NS_BIO_SWEEP_MINUTE = int(os.environ.get("NS_BIO_SWEEP_MINUTE", 0))
+_ns_bio_sweep_last_date = None  # tanggal (date) terakhir sweep selesai dijalankan
+_ns_bio_sweep_running = False
+
+
+async def _ns_bio_sweep_one_group(client, chat_id: int) -> None:
+    """
+    Inspeksi bio semua admin NewsCore aktif di satu grup.
+
+    Untuk setiap admin: paksa fetch bio fresh via bot pembantu
+    (force_check_user, yang otomatis menulis admin_bio_ok ke bio_profiles
+    lewat check_admin_bio_text), lalu baca hasilnya dan eksekusi
+    enforce_admin_bio jika tidak patuh.
+    """
+    try:
+        ns_cfg = await ns_get_config(chat_id)
+        if not ns_cfg.get("enabled"):
+            return
+
+        ns_admins = await ns_get_current_admins(chat_id)
+        if not ns_admins:
+            return
+
+        from monitor_bot_reference import force_check_user, query_admin_bio_ok
+        from core.ns_bio_guard import enforce_admin_bio
+
+        for idx, admin_doc in enumerate(ns_admins):
+            uid = admin_doc.get("user_id")
+            if not uid:
+                continue
+            if idx > 0:
+                await asyncio.sleep(_NS_ACTION_DELAY)
+            try:
+                # force_check_user → fetch bio fresh via bot pembantu grup ini,
+                # otomatis menghitung & menyimpan admin_bio_ok terbaru.
+                await force_check_user(chat_id, uid)
+                admin_bio_ok = await query_admin_bio_ok(chat_id, uid)
+                if admin_bio_ok is False:
+                    await enforce_admin_bio(client, chat_id, uid, admin_bio_ok)
+            except Exception as e:
+                print(f"[NewsCore][BioSweep] gagal cek uid={uid} chat={chat_id}: {e}")
+    except Exception as e:
+        print(f"[NewsCore][BioSweep] gagal proses chat={chat_id}: {e}")
+
+
+async def newscore_bio_sweep_loop(client):
+    """
+    Loop berkala: setiap hari jam 03:00 WIB (default, bisa diubah via env
+    NS_BIO_SWEEP_HOUR/NS_BIO_SWEEP_MINUTE), inspeksi bio seluruh admin
+    NewsCore di seluruh grup yang fitur NewsCore-nya aktif & punya admin
+    NewsCore — bergiliran satu per satu grup.
+
+    Jalankan sekali dari antigcast.py setelah await app.start(), sama
+    seperti newscore_checker_loop.
+    """
+    global _ns_bio_sweep_last_date, _ns_bio_sweep_running
+    if _ns_bio_sweep_running:
+        return
+    _ns_bio_sweep_running = True
+    print("[NewsCore][BioSweep] Loop sweep bio admin dimulai.")
+
+    while True:
+        try:
+            now = datetime.now(TZ_WIB)
+            due = (
+                now.hour == _NS_BIO_SWEEP_HOUR
+                and now.minute >= _NS_BIO_SWEEP_MINUTE
+                and _ns_bio_sweep_last_date != now.date()
+            )
+            if due:
+                print("[NewsCore][BioSweep] Mulai sweep bio admin NewsCore harian.")
+                from database import newscore_cfg_db
+                all_cfgs = await newscore_cfg_db.find({"enabled": True}).to_list(length=500)
+                for cfg in all_cfgs:
+                    cid = cfg.get("chat_id")
+                    if not cid:
+                        continue
+                    try:
+                        await _ns_bio_sweep_one_group(client, cid)
+                    except Exception as e:
+                        print(f"[NewsCore][BioSweep] error grup {cid}: {e}")
+                    # Jeda antar grup — bergiliran, tidak burst semua grup sekaligus
+                    await asyncio.sleep(_NS_ACTION_DELAY * 4)
+                _ns_bio_sweep_last_date = now.date()
+                print("[NewsCore][BioSweep] Sweep bio admin NewsCore harian selesai.")
+        except Exception as e:
+            print(f"[NewsCore][BioSweep] loop error: {e}")
         await asyncio.sleep(30)
 
 

@@ -13,6 +13,7 @@ Tiap jenis pelanggaran punya detail alasan spesifik (bukan generic).
 import os
 import re
 import time
+import html
 import hashlib
 import asyncio
 from datetime import datetime
@@ -173,7 +174,8 @@ def _fmt_waktu() -> str:
 
 # ── Helper: baris user ────────────────────────────────────────────────────────
 def _user_line(uid: int, name: str) -> str:
-    return f"<a href='tg://user?id={uid}'>{name}</a> (<code>{uid}</code>)"
+    safe_name = html.escape(name or str(uid))
+    return f"<a href='tg://user?id={uid}'>{safe_name}</a> (<code>{uid}</code>)"
 
 
 # ── LOG 1: Bot masuk grup baru ────────────────────────────────────────────────
@@ -181,7 +183,7 @@ def _user_line(uid: int, name: str) -> str:
 async def log_new_group(client: Client, message: Message):
     if not message.new_chat_members or not LOG_CHANNEL:
         return
-    me = client.me #await client.get_me()
+    me = client.me
     for member in message.new_chat_members:
         if member.id == me.id:
             chat  = message.chat
@@ -189,7 +191,7 @@ async def log_new_group(client: Client, message: Message):
                 "<b>❖ SISTEM — NODE BARU ❖</b>\n"
                 "<blockquote>"
                 "➕ Bot bergabung ke grup baru\n"
-                f"◈ <b>Grup:</b> {chat.title}\n"
+                f"◈ <b>Grup:</b> {html.escape(chat.title)}\n"
                 f"◈ <b>ID:</b> <code>{chat.id}</code>\n"
                 f"◈ <b>Username:</b> @{chat.username if chat.username else '—'}\n"
                 f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
@@ -214,8 +216,8 @@ async def list_grup_pengguna(client: Client, message: Message):
             chat = await client.get_chat(chat_id)
             username = f"@{chat.username}" if chat.username else "—"
             grup_list.append(
-                f"◈ <b>{chat.title}</b>\n"
-                f"   └ ID: <code>{chat_id}</code> | Link: {username}"
+                f"◈ <b>{html.escape(chat.title)}</b>\n"
+                f"   └ ID: <code>{chat_id}</code> | Link: {html.escape(username)}"
             )
         except Exception:
             await config_db.delete_one({"chat_id": chat_id})
@@ -286,7 +288,7 @@ async def log_deletion_trigger(client: Client, message: Message):
         except Exception:
             continue
         if match_with_leet(pat, regex_safe) or (teks_super_clean and pat.search(teks_super_clean)):
-            raw_tag = doc.get("raw", pat.pattern)
+            raw_tag = html.escape(str(doc.get("raw", pat.pattern)))
             alasan  = "Filter Regex Global"
             detail  = (
                 f"◈ <b>Pola cocok:</b> <code>{raw_tag}</code>\n"
@@ -300,7 +302,7 @@ async def log_deletion_trigger(client: Client, message: Message):
             if match_with_leet(pat, regex_safe):
                 alasan = "Filter Regex Grup"
                 detail = (
-                    f"◈ <b>Pola cocok:</b> <code>{raw_pattern}</code>\n"
+                    f"◈ <b>Pola cocok:</b> <code>{html.escape(str(raw_pattern))}</code>\n"
                     f"◈ <b>Keterangan:</b> Kata kunci dalam filter lokal grup ini"
                 )
                 break
@@ -406,10 +408,10 @@ async def log_deletion_trigger(client: Client, message: Message):
         "<blockquote>"
         f"{icon} <b>Tipe:</b> {alasan}\n"
         f"◈ <b>User:</b> {user_mention}\n"
-        f"◈ <b>Grup:</b> {message.chat.title} (<code>{cid}</code>)\n"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
         f"{detail}\n\n"
-        f"📨 <b>Konten:</b>\n<code>{content[:500]}</code>"
+        f"📨 <b>Konten:</b>\n<code>{html.escape(content[:500])}</code>"
         "</blockquote>"
     )
     await _send_log(client, log_text)
@@ -428,11 +430,11 @@ async def log_spam_global(client: Client, message: Message, pola: str, indikator
         "<blockquote>"
         f"🌐 <b>Tipe:</b> Deteksi AI Global\n"
         f"◈ <b>User:</b> {user_mention}\n"
-        f"◈ <b>Grup:</b> {message.chat.title} (<code>{cid}</code>)\n"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
         f"◈ <b>Keterangan:</b> Model AI mendeteksi pola spam lintas grup\n"
-        f"◈ <b>Indikator AI:</b> <code>{indikator}</code>\n"
-        f"◈ <b>Pola terdeteksi:</b> <code>{pola[:80]}</code>"
+        f"◈ <b>Indikator AI:</b> <code>{html.escape(str(indikator))}</code>\n"
+        f"◈ <b>Pola terdeteksi:</b> <code>{html.escape(str(pola)[:80])}</code>"
         "</blockquote>"
     )
     await _send_log(client, log_text)
@@ -449,11 +451,11 @@ async def log_spam_lokal(client: Client, message: Message, pola: str, indikator:
         "<blockquote>"
         f"⚙️ <b>Tipe:</b> Filter Manual Owner (Nexus AI)\n"
         f"◈ <b>User:</b> {user_mention}\n"
-        f"◈ <b>Grup:</b> {message.chat.title} (<code>{cid}</code>)\n"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
         f"◈ <b>Keterangan:</b> Cocok dengan filter kata yang diset owner\n"
-        f"◈ <b>Indikator AI:</b> <code>{indikator}</code>\n"
-        f"◈ <b>Pola terdeteksi:</b> <code>{pola[:80]}</code>"
+        f"◈ <b>Indikator AI:</b> <code>{html.escape(str(indikator))}</code>\n"
+        f"◈ <b>Pola terdeteksi:</b> <code>{html.escape(str(pola)[:80])}</code>"
         "</blockquote>"
     )
     await _send_log(client, log_text)

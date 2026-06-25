@@ -10,6 +10,7 @@ Contoh: /reset mybot
 """
 
 import os
+import html
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ParseMode
@@ -47,6 +48,7 @@ async def cmd_reset(client: Client, message: Message):
 
     code_bot = message.command[1].strip().lower()
     _pending_reset[message.from_user.id] = code_bot
+    code_bot_safe = html.escape(code_bot)
 
     keyboard = InlineKeyboardMarkup([
         [
@@ -61,7 +63,7 @@ async def cmd_reset(client: Client, message: Message):
     await message.reply(
         f"⚠️ <b>KONFIRMASI RESET DATABASE</b>\n\n"
         f"Namespace yang akan direset:\n"
-        f"<code>CODE_BOT = {code_bot}</code>\n\n"
+        f"<code>CODE_BOT = {code_bot_safe}</code>\n\n"
         f"<b>Data yang akan dihapus secara permanen:</b>\n"
         f"  ◈ Pengaturan semua grup (local/global/bio/waktu)\n"
         f"  ◈ Filter kata & regex per grup\n"
@@ -83,6 +85,7 @@ async def cb_reset_confirm(client, cb):
     await cb.answer("⏳ Menghapus data...")
 
     code_bot = cb.matches[0].group(1)
+    code_bot_safe = html.escape(code_bot)
 
     # Validasi: pastikan ini permintaan yang masih aktif
     if _pending_reset.get(cb.from_user.id) != code_bot:
@@ -95,7 +98,7 @@ async def cb_reset_confirm(client, cb):
     _pending_reset.pop(cb.from_user.id, None)
 
     await cb.message.edit(
-        f"⏳ <b>Menghapus semua data [{code_bot}]...</b>\n"
+        f"⏳ <b>Menghapus semua data [{code_bot_safe}]...</b>\n"
         f"<i>Mohon tunggu...</i>",
         parse_mode=ParseMode.HTML,
     )
@@ -104,18 +107,18 @@ async def cb_reset_confirm(client, cb):
         total, cleared = await reset_code_bot_data(code_bot)
     except Exception as e:
         return await cb.message.edit(
-            f"❌ <b>Error saat reset:</b>\n<code>{e}</code>",
+            f"❌ <b>Error saat reset:</b>\n<code>{html.escape(str(e))}</code>",
             parse_mode=ParseMode.HTML,
         )
 
     if cleared:
-        detail = "\n".join(f"  ◈ {c}" for c in cleared)
+        detail = "\n".join(f"  ◈ {html.escape(str(c))}" for c in cleared)
     else:
         detail = "  <i>(tidak ada data ditemukan untuk namespace ini)</i>"
 
     await cb.message.edit(
         f"✅ <b>RESET SELESAI</b>\n\n"
-        f"<b>Namespace:</b> <code>{code_bot}</code>\n"
+        f"<b>Namespace:</b> <code>{code_bot_safe}</code>\n"
         f"<b>Total dihapus:</b> <code>{total} dokumen/baris</code>\n\n"
         f"<b>Koleksi yang dibersihkan:</b>\n{detail}\n\n"
         f"<i>Bot akan berjalan dengan database kosong untuk namespace ini. "

@@ -114,7 +114,7 @@ async def cmd_govip(client: Client, message: Message):
     _group_cooldown[cid] = now
 
     try:
-        me = client.me #await client.get_me()
+        me = client.me
     except Exception:
         return
 
@@ -236,7 +236,7 @@ async def govip_start_intercept(client: Client, message: Message):
     )
 
     try:
-        me = client.me #await client.get_me()
+        me = client.me
         add_url = f"https://t.me/{me.username}?startgroup=true&admin={_FULL_ADMIN_RIGHTS}"
     except Exception:
         add_url = None

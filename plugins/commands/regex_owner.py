@@ -8,6 +8,7 @@ Perintah khusus OWNER untuk kelola regex global:
 
 import re
 import os
+import html
 import unicodedata
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
@@ -32,13 +33,14 @@ async def owner_management(client, message):
 
         raw_to_delete = " ".join(message.command[1:])
         result = await regex_db.delete_one({"raw": raw_to_delete})
+        raw_safe = html.escape(raw_to_delete)
 
         if result.deleted_count:
-            await message.reply(f"✅ Filter <code>{raw_to_delete}</code> berhasil dihapus.", parse_mode=ParseMode.HTML)
+            await message.reply(f"✅ Filter <code>{raw_safe}</code> berhasil dihapus.", parse_mode=ParseMode.HTML)
         else:
             await message.reply(
                 f"❌ <b>Data Not Found!</b>\n\n"
-                f"Kata <code>{raw_to_delete}</code> tidak ada di database.\n"
+                f"Kata <code>{raw_safe}</code> tidak ada di database.\n"
                 f"Cek dengan <code>/infobot</code>.",
                 parse_mode=ParseMode.HTML
             )
@@ -46,7 +48,7 @@ async def owner_management(client, message):
     elif cmd == "infobot":
         docs = [doc async for doc in regex_db.find({})]
         if docs:
-            lines = "\n".join(f"<code>{doc.get('raw', '—')}</code>" for doc in docs)
+            lines = "\n".join(f"<code>{html.escape(str(doc.get('raw', '—')))}</code>" for doc in docs)
             text  = (
                 "<b>GLOBAL FIREWALL</b>\n\n"
                 f"⚡ Total Entri: <code>{len(docs)}</code>\n\n"

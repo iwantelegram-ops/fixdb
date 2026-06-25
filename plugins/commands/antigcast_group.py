@@ -129,7 +129,7 @@ async def antigcast_group_handler(client: Client, message: Message):
         asyncio.create_task(_auto_delete(notif, message, delay=10))
 
     except (UserIsBlocked, PeerIdInvalid, InputUserDeactivated):
-        me        = client.me #await client.get_me()
+        me        = client.me
         start_url = f"https://t.me/{me.username}?start=true"
 
         fallback = await message.reply(
